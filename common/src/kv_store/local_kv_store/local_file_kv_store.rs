@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use log::trace;
 use std::error::Error;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
 
 use crate::kv_store::Key;
@@ -26,7 +26,7 @@ impl LocalFileKVStore {
                     let path = std::path::Path::new(path.as_str());
                     let prefix = path.parent().unwrap();
                     match std::fs::create_dir_all(prefix) {
-                        Ok(_) => match std::fs::File::create(&path) {
+                        Ok(_) => match std::fs::File::create(path) {
                             Ok(f) => f,
                             Err(e) => return Err(e.to_string().into()),
                         },
