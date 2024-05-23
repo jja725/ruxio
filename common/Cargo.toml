@@ -2,6 +2,9 @@
 name = "ruxio-common"
 version = "0.1.0"
 edition = "2021"
+description = "native file cache library"
+repository = "https://github.com/jja725/ruxio"
+license = "Apache-2.0"
 
 [lib]
 name = "ruxio_common"
