@@ -1,8 +1,18 @@
-[package]
-name = "ruxio"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "common",
+]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
+log = "0.4"
+fern = { version = "0.6", features = ["colored"] }
+humantime = "2.1.0"
+anyhow = "1"
+thiserror = "1.0.50"
+tokio = { version = "1", features = ["full"] }
+lazy_static = "1.4"
+
+bytes = {version = "1"}
+
