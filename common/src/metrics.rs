@@ -1,15 +1,11 @@
 use prometheus::{
-    labels, register_counter, register_histogram, register_int_counter_vec, register_int_gauge,
+    register_counter, register_histogram, register_int_counter_vec, register_int_gauge,
 };
 use prometheus::{Counter, Histogram, IntCounterVec, IntGauge, Opts, Registry};
 
 use lazy_static::lazy_static;
 
-use std::error::Error;
-
-use log::{error, trace};
-
-use crate::settings::SETTINGS;
+use log::error;
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -34,42 +30,6 @@ lazy_static! {
         register_counter!("gcs_fetches_total", "Total GCS fetch requests").unwrap();
     pub static ref GCS_FETCH_LATENCY: Histogram =
         register_histogram!("gcs_fetch_latency_seconds", "GCS fetch latency").unwrap();
-    static ref PUSH_COUNTER: Counter =
-        register_counter!("push_counter", "Total number of prometheus client pushed.").unwrap();
-    static ref PUSH_REQ_HISTOGRAM: Histogram = register_histogram!(
-        "push_request_latency_seconds",
-        "The push request latencies in seconds."
-    )
-    .unwrap();
-}
-
-pub fn push_metrics() -> Result<(), Box<dyn Error>> {
-    let push_uri = match SETTINGS.metrics_push_uri.as_deref() {
-        Some(uri) => uri,
-        None => return Ok(()),
-    };
-    trace!("Pushing metrics to gateway {}", push_uri);
-
-    PUSH_COUNTER.inc();
-    let metric_families = prometheus::gather();
-    let _timer = PUSH_REQ_HISTOGRAM.start_timer();
-    let push_result = prometheus::push_metrics(
-        "ruxio_worker",
-        labels! {"instance".to_owned() => format!("{}:{}", SETTINGS.local_ip, SETTINGS.control_port),},
-        push_uri,
-        metric_families,
-        None,
-    );
-    match push_result {
-        Ok(_) => {
-            trace!("Pushing metrics to gateway {} succeed", push_uri);
-            Ok(())
-        }
-        Err(e) => {
-            error!("Push metrics failed: {}", e);
-            Ok(())
-        }
-    }
 }
 
 pub fn metrics_result() -> String {
