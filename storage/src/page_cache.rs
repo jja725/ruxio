@@ -191,6 +191,17 @@ impl PageCache {
         self.root.join(key.to_path_component())
     }
 
+    /// Write page data to disk and return the path.
+    /// Creates parent directories as needed.
+    pub fn write_page_to_disk(&self, key: &PageKey, data: &[u8]) -> std::io::Result<PathBuf> {
+        let path = self.page_path(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, data)?;
+        Ok(path)
+    }
+
     /// Used bytes in cache.
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes

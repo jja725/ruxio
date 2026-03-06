@@ -25,6 +25,10 @@ use crate::page_key::PageKey;
 /// Two access modes:
 /// - `read_range()` — engine already knows which bytes (direct range read)
 /// - `scan()` — engine sends predicate, ruxio evaluates and streams matches
+///
+/// Two serving modes:
+/// - Normal: reads data into memory, returns Bytes (for small pages or non-Linux)
+/// - Zero-copy: returns file path for splice-based serving (file→socket, no userspace copy)
 pub struct CacheManager {
     pub gcs: GcsClient,
     pub metadata_cache: MetadataCache,
@@ -69,15 +73,7 @@ impl CacheManager {
                 // Cache miss → fetch from GCS
                 let fetch_end = page_offset + self.page_size;
                 let data = self.gcs.get_range(&req.uri, page_offset..fetch_end).await?;
-
-                // Cache the page (TinyLFU may reject)
-                let cached_page = CachedPage {
-                    local_path: self.page_cache.page_path(&key),
-                    size: data.len() as u64,
-                    data: Some(data.clone()),
-                };
-                self.page_cache.put(key, cached_page);
-
+                self.cache_page(&key, &data);
                 data
             };
 
@@ -93,6 +89,41 @@ impl CacheManager {
         }
 
         Ok(Bytes::from(result))
+    }
+
+    /// Get the on-disk file path and size for a cached page (for zero-copy serving).
+    ///
+    /// Returns `Some((path, size))` if the page is cached on disk,
+    /// `None` if it's a cache miss. The caller can then splice the file
+    /// directly to the TCP socket without any userspace buffer copies.
+    pub fn get_page_file(
+        &mut self,
+        uri: &str,
+        page_offset: u64,
+    ) -> Option<(std::path::PathBuf, u64)> {
+        let key = PageKey::new(uri, 0, page_offset);
+        if let Some(page) = self.page_cache.get(&key) {
+            if page.local_path.exists() {
+                return Some((page.local_path.clone(), page.size));
+            }
+        }
+        None
+    }
+
+    /// Cache a page: write to disk and insert into page cache.
+    fn cache_page(&mut self, key: &PageKey, data: &Bytes) {
+        // Write to disk
+        let local_path = match self.page_cache.write_page_to_disk(key, data) {
+            Ok(p) => p,
+            Err(_) => self.page_cache.page_path(key),
+        };
+
+        let cached_page = CachedPage {
+            local_path,
+            size: data.len() as u64,
+            data: Some(data.clone()),
+        };
+        self.page_cache.put(key.clone(), cached_page);
     }
 
     /// Get file metadata (Parquet footer).

@@ -4,3 +4,4 @@ pub mod gcs;
 pub mod metadata_cache;
 pub mod page_cache;
 pub mod page_key;
+pub mod zero_copy;

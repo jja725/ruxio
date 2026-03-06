@@ -10,6 +10,7 @@ use ruxio_protocol::messages::{
     ReadRangeRequest, RedirectResponse, ScanRequest,
 };
 use ruxio_storage::cache::CacheManager;
+use ruxio_storage::zero_copy;
 
 /// Serve the binary data plane on the given address.
 pub async fn serve_data_plane(
@@ -49,7 +50,8 @@ async fn handle_connection(
         reader.feed(&buf[..n]);
 
         while let Some(frame) = reader.next_frame()? {
-            let response_frames = process_frame(frame, cache_manager, membership).await;
+            let response_frames =
+                process_frame(frame, cache_manager, membership, &mut stream).await;
             for resp in response_frames {
                 let encoded = resp.encode();
                 let (result, _) = stream.write_all(encoded.to_vec()).await;
@@ -63,6 +65,7 @@ async fn process_frame(
     frame: Frame,
     cache_manager: &mut CacheManager,
     membership: &ClusterMembership,
+    stream: &mut TcpStream,
 ) -> Vec<Frame> {
     let request_id = frame.request_id;
 
@@ -99,7 +102,24 @@ async fn process_frame(
                 }
             }
 
-            // Serve range read
+            // Serve range read — try zero-copy first, fall back to buffered
+            // Zero-copy: splice page file directly to socket (no userspace copy)
+            let page_offset = (req.offset / (4 * 1024 * 1024)) * (4 * 1024 * 1024);
+            if req.length == 4 * 1024 * 1024 && req.offset == page_offset {
+                // Aligned 4MB read — candidate for zero-copy
+                if let Some((file_path, file_size)) =
+                    cache_manager.get_page_file(&req.uri, page_offset)
+                {
+                    match zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream)
+                        .await
+                    {
+                        Ok(_) => return vec![], // already sent directly to socket
+                        Err(_) => {}            // fall through to buffered path
+                    }
+                }
+            }
+
+            // Buffered path (non-aligned reads, cache misses, or splice failure)
             match cache_manager.read_range(&req).await {
                 Ok(data) => {
                     vec![

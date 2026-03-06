@@ -10,6 +10,10 @@ description = "Benchmarking tools for ruxio distributed cache"
 name = "ruxio-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "ruxio-e2e"
+path = "src/e2e.rs"
+
 [[bench]]
 name = "page_cache"
 harness = false
@@ -29,6 +33,7 @@ ruxio-storage = { workspace = true }
 ruxio-cluster = { workspace = true }
 monoio = { workspace = true }
 bytes = { workspace = true }
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
