@@ -1,0 +1,17 @@
+#!/bin/sh
+# Pre-commit hook: format check
+# Ensures all Rust code is properly formatted before committing.
+
+# Check if cargo fmt is available
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo not found, skipping format check"
+    exit 0
+fi
+
+# Run cargo fmt check
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "ERROR: Rust formatting check failed."
+    echo "Run 'cargo fmt --all' to fix, then re-commit."
+    exit 1
+fi

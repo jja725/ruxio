@@ -2,7 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "ruxio-bench", about = "Benchmarking tool for ruxio distributed cache")]
+#[command(
+    name = "ruxio-bench",
+    about = "Benchmarking tool for ruxio distributed cache"
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,

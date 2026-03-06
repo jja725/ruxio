@@ -50,7 +50,7 @@ pub struct GcsSettings {
 impl Default for CacheSettings {
     fn default() -> Self {
         Self {
-            page_size_bytes: 4 * 1024 * 1024, // 4MB
+            page_size_bytes: 4 * 1024 * 1024,         // 4MB
             max_cache_bytes: 10 * 1024 * 1024 * 1024, // 10GB
             max_metadata_entries: 100_000,
             metadata_ttl_secs: 300,
@@ -119,24 +119,16 @@ impl From<Config> for Settings {
             max_metadata_entries: config
                 .get::<usize>("cache.max_metadata_entries")
                 .unwrap_or(100_000),
-            metadata_ttl_secs: config
-                .get::<u64>("cache.metadata_ttl_secs")
-                .unwrap_or(300),
+            metadata_ttl_secs: config.get::<u64>("cache.metadata_ttl_secs").unwrap_or(300),
             root_path: config
                 .get::<String>("cache.root_path")
                 .unwrap_or_else(|_| "/tmp/ruxio_cache".into()),
         };
 
         let gcs = GcsSettings {
-            bucket: config
-                .get::<String>("gcs.bucket")
-                .unwrap_or_default(),
-            max_idle_connections: config
-                .get::<usize>("gcs.max_idle_connections")
-                .unwrap_or(8),
-            idle_timeout_secs: config
-                .get::<u64>("gcs.idle_timeout_secs")
-                .unwrap_or(60),
+            bucket: config.get::<String>("gcs.bucket").unwrap_or_default(),
+            max_idle_connections: config.get::<usize>("gcs.max_idle_connections").unwrap_or(8),
+            idle_timeout_secs: config.get::<u64>("gcs.idle_timeout_secs").unwrap_or(60),
             credentials_path: config.get::<String>("gcs.credentials_path").ok(),
         };
 
@@ -161,8 +153,7 @@ impl From<Config> for Settings {
 
 impl Settings {
     pub fn new() -> Result<Self> {
-        let config_filename =
-            env::var("RUXIO_CONFIG").unwrap_or_else(|_| "ruxio_config".into());
+        let config_filename = env::var("RUXIO_CONFIG").unwrap_or_else(|_| "ruxio_config".into());
         let settings: Settings = Config::builder()
             .add_source(File::with_name(config_filename.as_str()).required(false))
             .add_source(Environment::with_prefix("RUXIO").separator("__"))

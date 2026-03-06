@@ -1,8 +1,8 @@
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use ruxio_storage::cache_trait::Cache;
 use ruxio_storage::page_cache::{CachedPage, PageCache};
 use ruxio_storage::page_key::PageKey;
-use bytes::Bytes;
 use std::path::PathBuf;
 
 fn bench_page_cache_put(c: &mut Criterion) {
@@ -58,5 +58,10 @@ fn bench_page_cache_get_miss(c: &mut Criterion) {
     });
 }
 
-criterion_group!(page_cache_benches, bench_page_cache_put, bench_page_cache_get_hit, bench_page_cache_get_miss);
+criterion_group!(
+    page_cache_benches,
+    bench_page_cache_put,
+    bench_page_cache_get_hit,
+    bench_page_cache_get_miss
+);
 criterion_main!(page_cache_benches);

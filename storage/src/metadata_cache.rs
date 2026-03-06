@@ -261,7 +261,10 @@ fn evaluate_stats_comparison(
             }
         }
         (Statistics::Float(s), ScalarValue::Float64(v)) => {
-            match (s.min_opt().map(|x| *x as f64), s.max_opt().map(|x| *x as f64)) {
+            match (
+                s.min_opt().map(|x| *x as f64),
+                s.max_opt().map(|x| *x as f64),
+            ) {
                 (Some(min), Some(max)) => match op {
                     CompOp::Eq => *v >= min && *v <= max,
                     CompOp::Ne => true,

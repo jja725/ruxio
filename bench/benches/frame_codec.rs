@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion};
 use bytes::Bytes;
+use criterion::{criterion_group, criterion_main, Criterion};
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::ReadRangeRequest;
 
@@ -55,5 +55,10 @@ fn bench_frame_reader_throughput(c: &mut Criterion) {
     });
 }
 
-criterion_group!(frame_codec_benches, bench_frame_encode, bench_frame_decode, bench_frame_reader_throughput);
+criterion_group!(
+    frame_codec_benches,
+    bench_frame_encode,
+    bench_frame_decode,
+    bench_frame_reader_throughput
+);
 criterion_main!(frame_codec_benches);

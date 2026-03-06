@@ -142,7 +142,10 @@ async fn process_frame(
                         frames.push(Frame::new_raw(MessageType::DataChunk, request_id, data));
                     }
                     Err(e) => {
-                        error!("Batch read error for {} offset {}: {e}", req.uri, req.offset);
+                        error!(
+                            "Batch read error for {} offset {}: {e}",
+                            req.uri, req.offset
+                        );
                     }
                 }
             }
@@ -228,7 +231,11 @@ async fn process_frame(
                 Ok(pages) => {
                     let mut frames = Vec::with_capacity(pages.len() + 1);
                     for page_data in pages {
-                        frames.push(Frame::new_raw(MessageType::DataChunk, request_id, page_data));
+                        frames.push(Frame::new_raw(
+                            MessageType::DataChunk,
+                            request_id,
+                            page_data,
+                        ));
                     }
                     frames.push(Frame::done(request_id));
                     frames
