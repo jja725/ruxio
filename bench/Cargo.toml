@@ -1,0 +1,39 @@
+[package]
+name = "ruxio-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmarking tools for ruxio distributed cache"
+
+[[bin]]
+name = "ruxio-bench"
+path = "src/main.rs"
+
+[[bench]]
+name = "page_cache"
+harness = false
+
+[[bench]]
+name = "hash_ring"
+harness = false
+
+[[bench]]
+name = "frame_codec"
+harness = false
+
+[dependencies]
+ruxio-common = { workspace = true }
+ruxio-protocol = { workspace = true }
+ruxio-storage = { workspace = true }
+ruxio-cluster = { workspace = true }
+monoio = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+hdrhistogram = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }

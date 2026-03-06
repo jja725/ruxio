@@ -7,12 +7,9 @@ use lazy_static::lazy_static;
 
 use std::error::Error;
 
-use log::{error, info, trace};
+use log::{error, trace};
 
 use crate::settings::SETTINGS;
-
-use std::time::Duration;
-use tokio::time::sleep;
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -27,6 +24,16 @@ lazy_static! {
     .unwrap();
     pub static ref RESPONSE_TIME_COLLECTOR: Histogram =
         register_histogram!("response_time", "Response Times").unwrap();
+    pub static ref CACHE_HIT_COUNTER: Counter =
+        register_counter!("cache_hits_total", "Total cache hits").unwrap();
+    pub static ref CACHE_MISS_COUNTER: Counter =
+        register_counter!("cache_misses_total", "Total cache misses").unwrap();
+    pub static ref PAGE_CACHE_BYTES: IntGauge =
+        register_int_gauge!("page_cache_bytes", "Current page cache size in bytes").unwrap();
+    pub static ref GCS_FETCH_COUNTER: Counter =
+        register_counter!("gcs_fetches_total", "Total GCS fetch requests").unwrap();
+    pub static ref GCS_FETCH_LATENCY: Histogram =
+        register_histogram!("gcs_fetch_latency_seconds", "GCS fetch latency").unwrap();
     static ref PUSH_COUNTER: Counter =
         register_counter!("push_counter", "Total number of prometheus client pushed.").unwrap();
     static ref PUSH_REQ_HISTOGRAM: Histogram = register_histogram!(
@@ -36,34 +43,19 @@ lazy_static! {
     .unwrap();
 }
 
-pub async fn start_push() -> Result<(), Box<dyn Error>> {
-    if SETTINGS.metrics_push_uri.is_none() {
-        info!("No prometheus push uri specified");
-        return Ok(());
-    }
-    tokio::spawn(async move {
-        loop {
-            tokio::task::spawn_blocking(move || {
-                let _ = push_metrics();
-            });
-            sleep(Duration::from_secs(30)).await;
-        }
-    });
-
-    tokio::task::yield_now().await;
-    Ok(())
-}
-
 pub fn push_metrics() -> Result<(), Box<dyn Error>> {
-    let push_uri = SETTINGS.metrics_push_uri.as_deref().unwrap();
+    let push_uri = match SETTINGS.metrics_push_uri.as_deref() {
+        Some(uri) => uri,
+        None => return Ok(()),
+    };
     trace!("Pushing metrics to gateway {}", push_uri);
 
     PUSH_COUNTER.inc();
     let metric_families = prometheus::gather();
     let _timer = PUSH_REQ_HISTOGRAM.start_timer();
     let push_result = prometheus::push_metrics(
-        "fairy_worker",
-        labels! {"instance".to_owned() => format!("{}:{}", SETTINGS.local_ip, SETTINGS.http_port),},
+        "ruxio_worker",
+        labels! {"instance".to_owned() => format!("{}:{}", SETTINGS.local_ip, SETTINGS.control_port),},
         push_uri,
         metric_families,
         None,
@@ -111,6 +103,5 @@ pub fn metrics_result() -> String {
     buffer.clear();
 
     res.push_str(&res_custom);
-
     res
 }

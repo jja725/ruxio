@@ -1,0 +1,28 @@
+[package]
+name = "ruxio-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage layer: GCS client, page cache, metadata cache for ruxio"
+
+[lib]
+name = "ruxio_storage"
+path = "src/lib.rs"
+
+[dependencies]
+ruxio-common = { workspace = true }
+ruxio-protocol = { workspace = true }
+monoio = { workspace = true }
+monoio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+parquet = { workspace = true }
+arrow = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }

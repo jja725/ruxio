@@ -1,0 +1,21 @@
+[package]
+name = "ruxio-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Consistent hashing and cluster membership for ruxio"
+
+[lib]
+name = "ruxio_cluster"
+path = "src/lib.rs"
+
+[dependencies]
+ruxio-common = { workspace = true }
+ruxio-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }

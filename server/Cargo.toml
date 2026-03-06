@@ -1,0 +1,26 @@
+[package]
+name = "ruxio-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ruxio distributed cache server"
+
+[[bin]]
+name = "ruxio-server"
+path = "src/main.rs"
+
+[dependencies]
+ruxio-common = { workspace = true }
+ruxio-protocol = { workspace = true }
+ruxio-storage = { workspace = true }
+ruxio-cluster = { workspace = true }
+monoio = { workspace = true }
+h2 = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
