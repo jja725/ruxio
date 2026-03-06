@@ -43,7 +43,7 @@ fn populate_cache(page_cache: &mut PageCache) {
 
 // ── Server ───────────────────────────────────────────────────────────
 
-fn start_server_thread(port: u16, use_zero_copy: bool) {
+fn start_server_thread(port: u16, use_zero_copy: bool, use_direct_io: bool) {
     std::thread::spawn(move || {
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_timer()
@@ -56,7 +56,8 @@ fn start_server_thread(port: u16, use_zero_copy: bool) {
             let mut page_cache = PageCache::new(
                 format!("/tmp/ruxio_e2e_test/{port}"),
                 2 * 1024 * 1024 * 1024,
-            );
+            )
+            .with_direct_io(use_direct_io);
             populate_cache(&mut page_cache);
             let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
             let self_id = NodeId::new("127.0.0.1", port);
@@ -268,6 +269,10 @@ fn main() {
         .unwrap_or(10);
     let mode = std::env::args().nth(4).unwrap_or_default();
     let use_zero_copy = mode != "buffered";
+    let use_direct_io = std::env::args()
+        .nth(5)
+        .map(|s| s == "direct")
+        .unwrap_or(false);
 
     println!("=== Ruxio E2E Throughput Benchmark ===");
     println!();
@@ -280,15 +285,23 @@ fn main() {
     println!(
         "  Mode:               {}",
         if use_zero_copy {
-            "zero-copy"
+            "zero-copy (sendfile)"
         } else {
             "buffered"
         }
     );
+    println!(
+        "  I/O:                {}",
+        if use_direct_io {
+            "O_DIRECT (bypass page cache)"
+        } else {
+            "buffered (OS page cache)"
+        }
+    );
     if cfg!(target_os = "linux") {
-        println!("  Platform:           Linux (splice via io_uring)");
+        println!("  Platform:           Linux");
     } else {
-        println!("  Platform:           macOS (fallback: read+write)");
+        println!("  Platform:           macOS");
     }
     println!();
 
@@ -302,7 +315,7 @@ fn main() {
         BASE_PORT + num_server_threads as u16 - 1
     );
     for i in 0..num_server_threads {
-        start_server_thread(BASE_PORT + i as u16, use_zero_copy);
+        start_server_thread(BASE_PORT + i as u16, use_zero_copy, use_direct_io);
     }
     std::thread::sleep(Duration::from_millis(500)); // let servers bind
 

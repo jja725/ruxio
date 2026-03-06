@@ -143,15 +143,16 @@ struct ClockEntry {
 
 /// Page cache with CLOCK-Pro eviction, TinyLFU admission, and Bloom filters.
 ///
-/// Callers use the simple `Cache<PageKey, CachedPage>` interface.
-/// Internal complexity is hidden:
-///   - CLOCK-Pro tracks recency + frequency, resists scan pollution
-///   - TinyLFU filters one-time accesses before admission
-///   - Per-file Bloom filters for fast "any page cached?" checks
+/// Supports two I/O modes:
+/// - **Buffered** (default): uses OS page cache. Simple, good for small caches.
+/// - **Direct I/O** (`O_DIRECT`): bypasses OS page cache. Avoids double-caching
+///   since we have our own CLOCK-Pro cache. More predictable latency, leaves
+///   more RAM for our cache. Best for NVMe SSDs.
 pub struct PageCache {
     root: PathBuf,
     max_bytes: u64,
     used_bytes: u64,
+    use_direct_io: bool,
 
     // Data storage
     pages: HashMap<PageKey, CachedPage>,
@@ -167,18 +168,33 @@ pub struct PageCache {
     file_bloom: HashMap<String, BloomFilter>,
 }
 
+/// Alignment required for O_DIRECT I/O (must match filesystem block size).
+const DIRECT_IO_ALIGN: usize = 4096;
+
 impl PageCache {
     pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
         Self {
             root: root.into(),
             max_bytes,
             used_bytes: 0,
+            use_direct_io: false,
             pages: HashMap::new(),
             clock: Vec::new(),
             clock_hand: 0,
             frequency_sketch: CountMinSketch::new(10 * CMS_WIDTH as u64),
             file_bloom: HashMap::new(),
         }
+    }
+
+    /// Enable Direct I/O (O_DIRECT) — bypasses OS page cache.
+    pub fn with_direct_io(mut self, enabled: bool) -> Self {
+        self.use_direct_io = enabled;
+        self
+    }
+
+    /// Whether Direct I/O is enabled.
+    pub fn direct_io_enabled(&self) -> bool {
+        self.use_direct_io
     }
 
     /// Quick Bloom filter check: might any page from this file be cached?
@@ -193,13 +209,29 @@ impl PageCache {
 
     /// Write page data to disk and return the path.
     /// Creates parent directories as needed.
+    /// Uses O_DIRECT when direct_io is enabled (requires aligned buffers).
     pub fn write_page_to_disk(&self, key: &PageKey, data: &[u8]) -> std::io::Result<PathBuf> {
         let path = self.page_path(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, data)?;
+
+        if self.use_direct_io {
+            write_direct(&path, data)?;
+        } else {
+            std::fs::write(&path, data)?;
+        }
         Ok(path)
+    }
+
+    /// Read page data from disk.
+    /// Uses O_DIRECT when direct_io is enabled.
+    pub fn read_page_from_disk(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        if self.use_direct_io {
+            read_direct(path)
+        } else {
+            std::fs::read(path)
+        }
     }
 
     /// Used bytes in cache.
@@ -427,4 +459,77 @@ mod tests {
         cms.increment(&key);
         assert!(cms.estimate(&key) >= 2);
     }
+
+    #[test]
+    fn test_direct_io_flag() {
+        let cache = PageCache::new("/tmp/ruxio_test", 1024 * 1024);
+        assert!(!cache.direct_io_enabled());
+
+        let cache = cache.with_direct_io(true);
+        assert!(cache.direct_io_enabled());
+    }
+}
+
+// ── Direct I/O helpers ───────────────────────────────────────────────
+
+/// Allocate a buffer aligned to DIRECT_IO_ALIGN.
+fn aligned_buffer(size: usize) -> Vec<u8> {
+    let aligned_size = (size + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1);
+    let layout = std::alloc::Layout::from_size_align(aligned_size, DIRECT_IO_ALIGN).unwrap();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe { Vec::from_raw_parts(ptr, aligned_size, aligned_size) }
+}
+
+/// Write data to file with O_DIRECT (Linux) or regular write (other platforms).
+#[cfg(target_os = "linux")]
+fn write_direct(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // O_DIRECT requires aligned buffer and aligned file offset
+    let mut aligned = aligned_buffer(data.len());
+    aligned[..data.len()].copy_from_slice(data);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?;
+
+    file.write_all(&aligned)?;
+    Ok(())
+}
+
+/// Read file with O_DIRECT (Linux).
+#[cfg(target_os = "linux")]
+fn read_direct(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file_size = std::fs::metadata(path)?.len() as usize;
+    let mut aligned = aligned_buffer(file_size);
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?;
+
+    file.read_exact(&mut aligned[..file_size])?;
+    aligned.truncate(file_size);
+    Ok(aligned)
+}
+
+/// Fallback for non-Linux: regular buffered I/O.
+#[cfg(not(target_os = "linux"))]
+fn write_direct(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_direct(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
 }
