@@ -26,6 +26,3 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"

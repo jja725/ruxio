@@ -39,10 +39,6 @@ struct Args {
     #[arg(long, default_value_t = 100_000)]
     max_metadata_entries: usize,
 
-    /// Use O_DIRECT for disk I/O (bypass OS page cache)
-    #[arg(long, default_value_t = false)]
-    direct_io: bool,
-
     /// Bind address
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
@@ -77,8 +73,7 @@ async fn main() -> Result<()> {
     let bucket = args.bucket.unwrap_or_default();
     let gcs = GcsClient::new(&bucket);
     let metadata_cache = MetadataCache::new(args.max_metadata_entries);
-    let page_cache =
-        PageCache::new(&args.cache_dir, args.max_cache_bytes).with_direct_io(args.direct_io);
+    let page_cache = PageCache::new(&args.cache_dir, args.max_cache_bytes);
     let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
 
     // Initialize cluster membership
