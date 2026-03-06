@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -8,40 +8,44 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Check formatting with rustfmt
-  formatting:
-    name: cargo fmt
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Rustfmt Check
-        uses: actions-rust-lang/rustfmt@v1
+      - run: cargo fmt --all -- --check
 
   clippy:
-    name: cargo clippy
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Install Dependencies
-        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      - name: clippy check
-        run: cargo clippy --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets
 
   test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - name: Install Dependencies
-      run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
-    - run: cargo --version --verbose
-    - run: rustc --version --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all --verbose
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all
