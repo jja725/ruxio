@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -52,6 +52,7 @@ fn start_client_thread(
     total_ops: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     duration_secs: u64,
+    latencies: Arc<Mutex<Vec<Duration>>>,
 ) {
     std::thread::spawn(move || {
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
@@ -85,20 +86,32 @@ fn start_client_thread(
 
             let deadline = Instant::now() + Duration::from_secs(duration_secs);
             let mut i = 0u64;
+            let mut local_latencies = Vec::with_capacity(4096);
 
             while Instant::now() < deadline {
                 let page_offset = (i % NUM_PAGES) * PAGE_SIZE;
+                let t0 = Instant::now();
                 let bytes = send_and_recv(&mut stream, i as u32, page_offset).await;
+                let lat = t0.elapsed();
                 if bytes == 0 {
                     eprintln!("Connection lost, stopping client");
                     break;
                 }
                 total_bytes.fetch_add(bytes, Ordering::Relaxed);
                 total_ops.fetch_add(1, Ordering::Relaxed);
+                local_latencies.push(lat);
                 i += 1;
             }
+
+            // Merge into shared latencies
+            latencies.lock().unwrap().extend(local_latencies);
         });
     });
+}
+
+fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    let idx = ((sorted.len() as f64) * p / 100.0) as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 fn main() {
@@ -131,6 +144,7 @@ fn main() {
     let total_bytes = Arc::new(AtomicU64::new(0));
     let total_ops = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(false));
+    let latencies = Arc::new(Mutex::new(Vec::new()));
 
     println!("Connecting {num_conns} clients...");
     for _ in 0..num_conns {
@@ -140,6 +154,7 @@ fn main() {
             total_ops.clone(),
             running.clone(),
             duration_secs,
+            latencies.clone(),
         );
     }
 
@@ -165,6 +180,9 @@ fn main() {
         last_ops = cur_ops;
     }
 
+    // Wait a moment for threads to finish and merge latencies
+    std::thread::sleep(Duration::from_millis(500));
+
     let elapsed = start.elapsed();
     let final_bytes = total_bytes.load(Ordering::Relaxed);
     let final_ops = total_ops.load(Ordering::Relaxed);
@@ -183,6 +201,22 @@ fn main() {
         final_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         elapsed.as_secs_f64()
     );
+
+    // Latency percentiles
+    let mut lats = latencies.lock().unwrap().clone();
+    if !lats.is_empty() {
+        lats.sort();
+        let avg = lats.iter().sum::<Duration>() / lats.len() as u32;
+        println!();
+        println!("  Latency ({} samples):", lats.len());
+        println!("    min:  {:?}", lats[0]);
+        println!("    avg:  {avg:?}");
+        println!("    p50:  {:?}", percentile(&lats, 50.0));
+        println!("    p90:  {:?}", percentile(&lats, 90.0));
+        println!("    p99:  {:?}", percentile(&lats, 99.0));
+        println!("    p999: {:?}", percentile(&lats, 99.9));
+        println!("    max:  {:?}", lats[lats.len() - 1]);
+    }
 
     std::process::exit(0);
 }
