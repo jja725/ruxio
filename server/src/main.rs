@@ -2,25 +2,24 @@ mod control;
 mod data;
 
 use anyhow::Result;
+use bytes::Bytes;
 use clap::Parser;
 use tracing::info;
 
 use ruxio_cluster::membership::{ClusterMembership, DiscoveryMode};
 use ruxio_cluster::ring::NodeId;
 use ruxio_storage::cache::CacheManager;
+use ruxio_storage::cache_trait::Cache;
 use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::MetadataCache;
-use ruxio_storage::page_cache::PageCache;
+use ruxio_storage::page_cache::{CachedPage, PageCache};
+use ruxio_storage::page_key::PageKey;
 
 #[derive(Parser, Debug)]
 #[command(name = "ruxio-server", about = "Ruxio distributed cache server")]
 struct Args {
-    /// Control plane port (HTTP/2)
-    #[arg(long, default_value_t = 8080)]
-    control_port: u16,
-
     /// Data plane port (binary protocol)
-    #[arg(long, default_value_t = 8081)]
+    #[arg(long, default_value_t = 51234)]
     data_port: u16,
 
     /// GCS bucket name
@@ -46,22 +45,43 @@ struct Args {
     /// Static peer list (comma-separated host:port)
     #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
+
+    /// Populate cache with test data for benchmarking (100 x 4MB pages)
+    #[arg(long, default_value_t = false)]
+    bench_populate: bool,
+}
+
+const PAGE_SIZE: u64 = 4 * 1024 * 1024;
+const BENCH_NUM_PAGES: u64 = 100;
+
+fn populate_bench_data(page_cache: &mut PageCache) {
+    let data = Bytes::from(vec![0xABu8; PAGE_SIZE as usize]);
+    for i in 0..BENCH_NUM_PAGES {
+        let key = PageKey::new("test://file.parquet", 0, i * PAGE_SIZE);
+        let local_path = page_cache
+            .write_page_to_disk(&key, &data)
+            .expect("failed to write bench page");
+        let page = CachedPage {
+            local_path,
+            size: PAGE_SIZE,
+            data: Some(data.clone()),
+        };
+        page_cache.put(key, page);
+    }
 }
 
 #[monoio::main(timer_enabled = true)]
 async fn main() -> Result<()> {
-    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ruxio=debug".parse().unwrap()),
+                .add_directive("ruxio=info".parse().unwrap()),
         )
         .init();
 
     let args = Args::parse();
 
     info!("Starting ruxio-server");
-    info!("  control_port: {}", args.control_port);
     info!("  data_port: {}", args.data_port);
     info!("  cache_dir: {}", args.cache_dir);
     info!("  max_cache: {} bytes", args.max_cache_bytes);
@@ -73,7 +93,18 @@ async fn main() -> Result<()> {
     let bucket = args.bucket.unwrap_or_default();
     let gcs = GcsClient::new(&bucket);
     let metadata_cache = MetadataCache::new(args.max_metadata_entries);
-    let page_cache = PageCache::new(&args.cache_dir, args.max_cache_bytes);
+    let mut page_cache = PageCache::new(&args.cache_dir, args.max_cache_bytes);
+
+    if args.bench_populate {
+        info!(
+            "Populating cache with {} x {}MB test pages",
+            BENCH_NUM_PAGES,
+            PAGE_SIZE / (1024 * 1024)
+        );
+        populate_bench_data(&mut page_cache);
+        info!("Cache populated");
+    }
+
     let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
 
     // Initialize cluster membership

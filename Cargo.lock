@@ -2066,6 +2066,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "bytes",
+ "libc",
  "monoio",
  "monoio-rustls",
  "parquet",
