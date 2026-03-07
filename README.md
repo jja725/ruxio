@@ -91,12 +91,11 @@ cargo test --all
 ### Run the server
 
 ```bash
-cargo run --bin ruxio-server -- \
+cargo run --release --bin ruxio-server -- \
   --bucket my-gcs-bucket \
   --cache-dir /mnt/nvme/ruxio \
   --max-cache-bytes 107374182400 \
-  --data-port 8081 \
-  --control-port 8080
+  --threads 16
 ```
 
 ### Benchmarks
@@ -105,12 +104,45 @@ cargo run --bin ruxio-server -- \
 # Criterion micro-benchmarks
 cargo bench
 
-# CLI benchmark tool (requires running server)
-cargo run --bin ruxio-bench -- scan \
-  --server localhost:8081 \
-  --uri gs://bucket/file.parquet \
-  --iterations 1000
+# E2E loopback benchmark (server + client in one process)
+cargo run --release --bin ruxio-e2e -- 4 16 10
+
+# Remote benchmark (two machines)
+# Machine A:
+./ruxio-server --bench-populate --threads 16
+# Machine B:
+./ruxio-bench-client <server-ip> 51234 64 10
 ```
+
+## Benchmark Results
+
+### Throughput (AMD EPYC 7B13, 4MB page reads)
+
+| Setup | Throughput | Bottleneck |
+|-------|-----------|------------|
+| 1 thread, loopback | 1.0 GB/s | Single-core CPU |
+| 4 threads, loopback, sendfile | 6.5 GB/s | - |
+| 4 threads, loopback, buffered | 3.9 GB/s | - |
+| 8 threads, loopback, sendfile | 7.5 GB/s | Loopback ceiling |
+| **32 conns, 32Gbps NIC, sendfile** | **3.6 GB/s (28.8 Gbps, 90%)** | **NIC** |
+| **64 conns, 32Gbps NIC, sendfile** | **3.68 GB/s (29.4 Gbps, 92%)** | **NIC** |
+
+sendfile zero-copy is **1.67x faster** than buffered I/O (6.5 vs 3.9 GB/s).
+
+Over a real 32Gbps NIC, ruxio saturates **92% of wire speed**. The software is not the bottleneck.
+
+### Micro-benchmarks
+
+| Component | Operation | Latency | Throughput |
+|-----------|-----------|---------|------------|
+| Page cache | put | 61 ns | 16.3M ops/s |
+| Page cache | get (hit) | 246 ns | 4.1M ops/s |
+| Page cache | get (miss) | 373 ns | 2.7M ops/s |
+| Bloom filter | lookup | 10 ns | 103M ops/s |
+| Hash ring | lookup (10 nodes) | 73 ns | 13.6M ops/s |
+| Hash ring | lookup (100 nodes) | 87 ns | 11.5M ops/s |
+| Frame codec | encode | 25 ns | 40.5M ops/s |
+| Frame codec | decode | 18 ns | 55.9M ops/s |
 
 ## Wire Protocol
 
