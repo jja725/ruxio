@@ -115,12 +115,9 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.cache_dir)?;
     let per_thread_cache_bytes = args.max_cache_bytes / threads as u64;
 
-    // Shared stats across all threads
-    let stats = control::ServerStats::new();
-
-    // Start health/stats HTTP endpoint
+    // Start health HTTP endpoint (memory stats)
     let health_addr = format!("{}:{}", args.bind, args.health_port);
-    control::start_health_server(health_addr, stats.clone());
+    control::start_health_server(health_addr);
 
     // Spawn N monoio threads — each owns its own cache partition, listens on
     // the same port via SO_REUSEPORT. The kernel distributes connections.
@@ -134,7 +131,6 @@ fn main() -> Result<()> {
         let bind = args.bind.clone();
         let data_port = args.data_port;
         let peers = args.peers.clone();
-        let stats = stats.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("ruxio-worker-{thread_id}"))
@@ -173,9 +169,8 @@ fn main() -> Result<()> {
                         let (stream, _) = listener.accept().await.unwrap();
                         let cm = cm.clone();
                         let mem = mem.clone();
-                        let stats = stats.clone();
                         monoio::spawn(async move {
-                            data::serve_connection(stream, cm, mem, stats).await;
+                            data::serve_connection(stream, cm, mem).await;
                         });
                     }
                 });

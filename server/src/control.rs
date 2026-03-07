@@ -1,33 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpListener;
 use tracing::info;
 
-/// Shared server stats — updated by data plane threads via atomics.
-#[derive(Clone)]
-pub struct ServerStats {
-    pub total_requests: Arc<AtomicU64>,
-    pub total_bytes_sent: Arc<AtomicU64>,
-    pub cache_hits: Arc<AtomicU64>,
-    pub cache_misses: Arc<AtomicU64>,
-}
-
-impl ServerStats {
-    pub fn new() -> Self {
-        Self {
-            total_requests: Arc::new(AtomicU64::new(0)),
-            total_bytes_sent: Arc::new(AtomicU64::new(0)),
-            cache_hits: Arc::new(AtomicU64::new(0)),
-            cache_misses: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
 /// Read process memory usage from /proc/self/status (Linux).
 fn get_memory_usage_kb() -> (u64, u64) {
-    // VmRSS = physical memory, VmSize = virtual memory
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let mut rss_kb = 0u64;
     let mut vm_kb = 0u64;
@@ -51,10 +27,10 @@ fn get_memory_usage_kb() -> (u64, u64) {
     (rss_kb, vm_kb)
 }
 
-/// Simple HTTP/1.1 health endpoint. Returns JSON stats on GET /health.
+/// Simple HTTP/1.1 health endpoint. Returns JSON with memory stats.
 ///
-/// Usage: `curl http://<host>:<control_port>/health`
-pub fn start_health_server(addr: String, stats: ServerStats) {
+/// Usage: `curl http://<host>:<health_port>/health`
+pub fn start_health_server(addr: String) {
     std::thread::Builder::new()
         .name("ruxio-health".to_string())
         .spawn(move || {
@@ -68,7 +44,6 @@ pub fn start_health_server(addr: String, stats: ServerStats) {
 
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let stats = stats.clone();
 
                     monoio::spawn(async move {
                         let mut buf = vec![0u8; 4096];
@@ -87,22 +62,10 @@ pub fn start_health_server(addr: String, stats: ServerStats) {
                                 "{{\n",
                                 "  \"status\": \"ok\",\n",
                                 "  \"memory_rss_mb\": {:.1},\n",
-                                "  \"memory_virtual_mb\": {:.1},\n",
-                                "  \"total_requests\": {},\n",
-                                "  \"total_bytes_sent\": {},\n",
-                                "  \"total_bytes_sent_gb\": {:.2},\n",
-                                "  \"cache_hits\": {},\n",
-                                "  \"cache_misses\": {}\n",
+                                "  \"memory_virtual_mb\": {:.1}\n",
                                 "}}\n"
                             ),
-                            rss_mb,
-                            vm_mb,
-                            stats.total_requests.load(Ordering::Relaxed),
-                            stats.total_bytes_sent.load(Ordering::Relaxed),
-                            stats.total_bytes_sent.load(Ordering::Relaxed) as f64
-                                / (1024.0 * 1024.0 * 1024.0),
-                            stats.cache_hits.load(Ordering::Relaxed),
-                            stats.cache_misses.load(Ordering::Relaxed),
+                            rss_mb, vm_mb,
                         );
 
                         let response = format!(

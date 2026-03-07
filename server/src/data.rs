@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -16,14 +15,11 @@ use ruxio_protocol::messages::{
 use ruxio_storage::cache::CacheManager;
 use ruxio_storage::zero_copy;
 
-use crate::control::ServerStats;
-
 /// Handle a single TCP connection.
 pub async fn serve_connection(
     mut stream: TcpStream,
     cache_manager: Rc<RefCell<CacheManager>>,
     membership: Rc<ClusterMembership>,
-    stats: ServerStats,
 ) {
     let mut reader = FrameReader::new();
     let mut buf = vec![0u8; 128 * 1024];
@@ -42,17 +38,10 @@ pub async fn serve_connection(
         reader.feed(&buf[..n]);
 
         while let Some(frame) = reader.next_frame().unwrap() {
-            stats.total_requests.fetch_add(1, Ordering::Relaxed);
             let response_frames =
                 process_frame(frame, &cache_manager, &membership, &mut stream).await;
             for resp in response_frames {
                 let encoded = resp.encode();
-                if resp.msg_type == MessageType::DataChunk {
-                    stats
-                        .total_bytes_sent
-                        .fetch_add(resp.payload.len() as u64, Ordering::Relaxed);
-                    stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                }
                 let (result, _) = stream.write_all(encoded.to_vec()).await;
                 if result.is_err() {
                     return;
