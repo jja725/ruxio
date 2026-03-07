@@ -8,11 +8,7 @@ use std::path::PathBuf;
 const NUM_KEYS: u64 = 1000;
 
 fn make_key(i: u64) -> PageKey {
-    PageKey::new(
-        "gs://bucket/file.parquet",
-        (i / 100) as usize,
-        (i % 100) * 4096,
-    )
+    PageKey::new("gs://bucket/file.parquet", i)
 }
 
 fn make_page() -> CachedPage {
@@ -25,7 +21,11 @@ fn make_page() -> CachedPage {
 
 fn bench_page_cache_put(c: &mut Criterion) {
     c.bench_function("page_cache_put", |b| {
-        let mut cache = PageCache::new("/tmp/ruxio_bench_cache", 1024 * 1024 * 1024);
+        let mut cache = PageCache::new(
+            "/tmp/ruxio_bench_cache",
+            1024 * 1024 * 1024,
+            4 * 1024 * 1024,
+        );
         let mut i = 0u64;
         b.iter(|| {
             let key = make_key(i % NUM_KEYS);
@@ -36,7 +36,11 @@ fn bench_page_cache_put(c: &mut Criterion) {
 }
 
 fn bench_page_cache_get_hit(c: &mut Criterion) {
-    let mut cache = PageCache::new("/tmp/ruxio_bench_cache", 1024 * 1024 * 1024);
+    let mut cache = PageCache::new(
+        "/tmp/ruxio_bench_cache",
+        1024 * 1024 * 1024,
+        4 * 1024 * 1024,
+    );
     for i in 0..NUM_KEYS {
         cache.put(make_key(i), make_page());
     }
@@ -52,7 +56,11 @@ fn bench_page_cache_get_hit(c: &mut Criterion) {
 }
 
 fn bench_page_cache_get_miss(c: &mut Criterion) {
-    let mut cache = PageCache::new("/tmp/ruxio_bench_cache", 1024 * 1024 * 1024);
+    let mut cache = PageCache::new(
+        "/tmp/ruxio_bench_cache",
+        1024 * 1024 * 1024,
+        4 * 1024 * 1024,
+    );
     // populate with keys 0..999
     for i in 0..NUM_KEYS {
         cache.put(make_key(i), make_page());
@@ -61,29 +69,33 @@ fn bench_page_cache_get_miss(c: &mut Criterion) {
     c.bench_function("page_cache_get_miss", |b| {
         let mut i = 0u64;
         b.iter(|| {
-            // lookup keys that don't exist (offset by NUM_KEYS)
-            let key = PageKey::new("gs://bucket/other.parquet", 0, i % 1000 * 4096);
+            // lookup keys that don't exist (different file)
+            let key = PageKey::new("gs://bucket/other.parquet", i % 1000);
             let _ = cache.get(&key);
             i += 1;
         });
     });
 }
 
-fn bench_page_cache_contains_bloom(c: &mut Criterion) {
-    let mut cache = PageCache::new("/tmp/ruxio_bench_cache", 1024 * 1024 * 1024);
+fn bench_page_cache_has_file(c: &mut Criterion) {
+    let mut cache = PageCache::new(
+        "/tmp/ruxio_bench_cache",
+        1024 * 1024 * 1024,
+        4 * 1024 * 1024,
+    );
     for i in 0..NUM_KEYS {
         cache.put(make_key(i), make_page());
     }
 
-    c.bench_function("page_cache_bloom_hit", |b| {
+    c.bench_function("page_cache_has_file_hit", |b| {
         b.iter(|| {
-            cache.maybe_has_file("gs://bucket/file.parquet");
+            cache.has_file("gs://bucket/file.parquet");
         });
     });
 
-    c.bench_function("page_cache_bloom_miss", |b| {
+    c.bench_function("page_cache_has_file_miss", |b| {
         b.iter(|| {
-            cache.maybe_has_file("gs://bucket/nonexistent.parquet");
+            cache.has_file("gs://bucket/nonexistent.parquet");
         });
     });
 }
@@ -93,6 +105,6 @@ criterion_group!(
     bench_page_cache_put,
     bench_page_cache_get_hit,
     bench_page_cache_get_miss,
-    bench_page_cache_contains_bloom,
+    bench_page_cache_has_file,
 );
 criterion_main!(page_cache_benches);

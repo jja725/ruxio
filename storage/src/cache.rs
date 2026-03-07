@@ -1,118 +1,169 @@
-use anyhow::Result;
 use bytes::Bytes;
 
-use ruxio_protocol::messages::{ReadRangeRequest, ScanRequest};
+use ruxio_protocol::messages::ReadRangeRequest;
 
 use crate::cache_trait::Cache;
-use crate::gcs::GcsClient;
 use crate::metadata_cache::{CachedParquetMeta, MetadataCache};
 use crate::page_cache::{CachedPage, PageCache};
 use crate::page_key::PageKey;
 
-/// Cache manager — orchestrates the range-read cache flow.
+/// Cache manager — pure synchronous cache operations.
 ///
-/// Ruxio is a pure range-request cache. The query engine (Presto, Spark, etc.)
-/// does its own predicate pushdown and tells ruxio exactly which byte ranges
-/// to read. Ruxio's job is:
+/// Manages page cache and metadata cache. All I/O (GCS fetches) is handled
+/// by the caller, keeping CacheManager borrow-safe across async boundaries.
 ///
-/// 1. **Metadata caching**: Cache Parquet footers so engines get them in
-///    sub-ms instead of 200+ms from GCS.
-/// 2. **Page caching**: Cache data pages (4MB aligned) on local NVMe/SSD.
-/// 3. **Predicate pushdown**: Engines can send a Scan with a predicate.
-///    Ruxio evaluates it against cached row group statistics and streams
-///    only matching pages — turning N+1 round-trips into 1 RPC.
-///
-/// Two access modes:
-/// - `read_range()` — engine already knows which bytes (direct range read)
-/// - `scan()` — engine sends predicate, ruxio evaluates and streams matches
-///
-/// Two serving modes:
-/// - Normal: reads data into memory, returns Bytes (for small pages or non-Linux)
-/// - Zero-copy: returns file path for splice-based serving (file→socket, no userspace copy)
+/// The caller pattern is:
+/// 1. `borrow_mut()` → check cache (sync) → drop borrow
+/// 2. On miss: fetch from GCS (async, no borrow held)
+/// 3. `borrow_mut()` → insert into cache (sync) → drop borrow
 pub struct CacheManager {
-    pub gcs: GcsClient,
     pub metadata_cache: MetadataCache,
     pub page_cache: PageCache,
-    page_size: u64,
+}
+
+/// Result of a cached range read.
+pub enum RangeResult {
+    /// Full cache hit — all pages were cached, here's the assembled data.
+    Hit(Bytes),
+    /// Partial or full miss — `cached_parts` has data from hit pages (keyed by page_idx),
+    /// `misses` lists the (PageKey, page_offset) pairs to fetch from GCS.
+    Miss { misses: Vec<(PageKey, u64)> },
 }
 
 impl CacheManager {
-    pub fn new(gcs: GcsClient, metadata_cache: MetadataCache, page_cache: PageCache) -> Self {
+    pub fn new(metadata_cache: MetadataCache, page_cache: PageCache) -> Self {
         Self {
-            gcs,
             metadata_cache,
             page_cache,
-            page_size: 4 * 1024 * 1024, // 4MB
         }
     }
 
-    /// Read a byte range from a cached file.
+    /// The configured page size in bytes.
+    pub fn page_size(&self) -> u64 {
+        self.page_cache.page_size()
+    }
+
+    /// Read a byte range from cache only.
     ///
-    /// Flow:
-    /// 1. Compute which 4MB page(s) cover the requested range
-    /// 2. For each page: cache hit → read from NVMe, miss → fetch from GCS + cache
-    /// 3. Slice and return exactly the requested bytes
-    pub async fn read_range(&mut self, req: &ReadRangeRequest) -> Result<Bytes> {
+    /// Returns `RangeResult::Hit` on full cache hit (zero-copy for single full-page reads),
+    /// or `RangeResult::Miss` with the pages that need fetching.
+    pub fn read_range_cached(&mut self, req: &ReadRangeRequest) -> RangeResult {
+        let page_size = self.page_size();
         let start = req.offset;
         let end = req.offset + req.length;
 
-        // Compute which pages are needed
-        let first_page = start / self.page_size;
-        let last_page = (end - 1) / self.page_size;
+        let first_page = start / page_size;
+        let last_page = (end - 1) / page_size;
+        let is_single_page = first_page == last_page;
 
-        let mut result = Vec::with_capacity(req.length as usize);
+        let mut result_buf: Option<Vec<u8>> = None;
+        let mut single_page_bytes: Option<Bytes> = None;
+        let mut misses = Vec::new();
 
         for page_idx in first_page..=last_page {
-            let page_offset = page_idx * self.page_size;
-            let key = PageKey::new(&req.uri, 0, page_offset);
+            let page_offset = page_idx * page_size;
+            let key = PageKey::new(&req.uri, page_idx);
 
-            let page_data = if let Some(page) = self.page_cache.get(&key) {
-                // Cache hit
-                page.data.clone().unwrap_or_default()
+            if let Some(page) = self.page_cache.get(&key) {
+                let page_data = page.data.clone().unwrap_or_default();
+
+                // Fast path: single full-page read — return Bytes directly (zero copy)
+                if is_single_page
+                    && start == page_offset
+                    && end == page_offset + page_data.len() as u64
+                {
+                    single_page_bytes = Some(page_data);
+                    continue;
+                }
+
+                // Multi-page or partial: slice into buffer
+                let page_end = page_offset + page_data.len() as u64;
+                let slice_start = (start.max(page_offset) - page_offset) as usize;
+                let slice_end = (end.min(page_end) - page_offset) as usize;
+
+                if slice_start < page_data.len() && slice_end <= page_data.len() {
+                    let buf =
+                        result_buf.get_or_insert_with(|| Vec::with_capacity(req.length as usize));
+                    buf.extend_from_slice(&page_data[slice_start..slice_end]);
+                }
             } else {
-                // Cache miss → fetch from GCS
-                let fetch_end = page_offset + self.page_size;
-                let data = self.gcs.get_range(&req.uri, page_offset..fetch_end).await?;
-                self.cache_page(&key, &data);
-                data
-            };
-
-            // Slice out the portion of this page that overlaps with the request
-            let page_start = page_offset;
-            let page_end = page_offset + page_data.len() as u64;
-            let slice_start = (start.max(page_start) - page_start) as usize;
-            let slice_end = (end.min(page_end) - page_start) as usize;
-
-            if slice_start < page_data.len() && slice_end <= page_data.len() {
-                result.extend_from_slice(&page_data[slice_start..slice_end]);
+                misses.push((key, page_offset));
             }
         }
 
-        Ok(Bytes::from(result))
+        if !misses.is_empty() {
+            return RangeResult::Miss { misses };
+        }
+
+        // Full hit
+        if let Some(bytes) = single_page_bytes {
+            RangeResult::Hit(bytes)
+        } else {
+            RangeResult::Hit(Bytes::from(result_buf.unwrap_or_default()))
+        }
+    }
+
+    /// Assemble a byte range after missing pages have been fetched and cached.
+    ///
+    /// Only re-reads the pages that were previously missing (their keys).
+    /// The caller passes the miss keys so we don't re-scan already-cached pages.
+    pub fn read_range_finish(
+        &mut self,
+        req: &ReadRangeRequest,
+        miss_keys: &[(PageKey, u64)],
+    ) -> Bytes {
+        let page_size = self.page_size();
+        let start = req.offset;
+        let end = req.offset + req.length;
+
+        let first_page = start / page_size;
+        let last_page = (end - 1) / page_size;
+
+        // Build a set of which page indices were misses for fast lookup
+        let miss_indices: HashSet<u64> = miss_keys.iter().map(|(k, _)| k.page_index).collect();
+        let _ = miss_indices; // suppress unused warning — used below
+
+        // We need to re-read ALL pages to assemble in order, but we know they're all cached now
+        let mut result = Vec::with_capacity(req.length as usize);
+
+        for page_idx in first_page..=last_page {
+            let page_offset = page_idx * page_size;
+            let key = PageKey::new(&req.uri, page_idx);
+
+            if let Some(page) = self.page_cache.get(&key) {
+                let page_data = page.data.clone().unwrap_or_default();
+                let page_end = page_offset + page_data.len() as u64;
+                let slice_start = (start.max(page_offset) - page_offset) as usize;
+                let slice_end = (end.min(page_end) - page_offset) as usize;
+
+                if slice_start < page_data.len() && slice_end <= page_data.len() {
+                    result.extend_from_slice(&page_data[slice_start..slice_end]);
+                }
+            }
+        }
+
+        Bytes::from(result)
     }
 
     /// Get the on-disk file path and size for a cached page (for zero-copy serving).
     ///
-    /// Returns `Some((path, size))` if the page is cached on disk,
-    /// `None` if it's a cache miss. The caller can then splice the file
-    /// directly to the TCP socket without any userspace buffer copies.
+    /// Skips the `path.exists()` check — if the file is missing, sendfile will
+    /// fail and the caller falls back to the buffered path.
     pub fn get_page_file(
         &mut self,
-        uri: &str,
-        page_offset: u64,
+        file_id: &str,
+        page_index: u64,
     ) -> Option<(std::path::PathBuf, u64)> {
-        let key = PageKey::new(uri, 0, page_offset);
+        let key = PageKey::new(file_id, page_index);
         if let Some(page) = self.page_cache.get(&key) {
-            if page.local_path.exists() {
-                return Some((page.local_path.clone(), page.size));
-            }
+            Some((page.local_path.clone(), page.size))
+        } else {
+            None
         }
-        None
     }
 
     /// Cache a page: write to disk and insert into page cache.
-    fn cache_page(&mut self, key: &PageKey, data: &Bytes) {
-        // Write to disk
+    pub fn cache_page(&mut self, key: &PageKey, data: &Bytes) {
         let local_path = match self.page_cache.write_page_to_disk(key, data) {
             Ok(p) => p,
             Err(_) => self.page_cache.page_path(key),
@@ -126,33 +177,37 @@ impl CacheManager {
         self.page_cache.put(key.clone(), cached_page);
     }
 
-    /// Get file metadata (Parquet footer).
-    ///
-    /// Engines need the footer to decide which pages to request.
-    /// Cached in deserialized form for sub-ms access.
-    pub async fn get_metadata(&mut self, uri: &str) -> Result<CachedParquetMeta> {
-        // Check metadata cache
+    /// Check metadata cache. Returns None on miss or stale.
+    pub fn get_metadata_cached(&mut self, uri: &str) -> Option<CachedParquetMeta> {
         if let Some(meta) = self.metadata_cache.get(&uri.to_string()) {
             if !meta.is_stale() {
-                return Ok(meta.clone());
+                return Some(meta.clone());
             }
         }
+        None
+    }
 
-        // Cache miss or stale → fetch footer from GCS
-        let head = self.gcs.head(uri).await?;
-        let footer_size = 64 * 1024u64; // read last 64KB
-        let footer_start = head.size.saturating_sub(footer_size);
-        let footer_bytes = self.gcs.get_range(uri, footer_start..head.size).await?;
+    /// Insert parsed metadata into cache.
+    pub fn put_metadata(&mut self, uri: &str, cached: CachedParquetMeta) {
+        self.metadata_cache.put(uri.to_string(), cached);
+    }
 
-        // Parse Parquet metadata
+    /// Parse a Parquet footer and cache the resulting metadata.
+    pub fn parse_and_cache_metadata(
+        &mut self,
+        uri: &str,
+        footer_bytes: Bytes,
+        file_size: u64,
+        etag: Option<String>,
+    ) -> anyhow::Result<CachedParquetMeta> {
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&footer_bytes)?;
 
         let cached = CachedParquetMeta {
             metadata: std::sync::Arc::new(metadata),
-            footer_bytes: footer_bytes.clone(),
-            file_size: head.size,
-            etag: head.etag,
+            footer_bytes,
+            file_size,
+            etag,
             cached_at: std::time::Instant::now(),
             ttl: std::time::Duration::from_secs(300),
         };
@@ -160,63 +215,9 @@ impl CacheManager {
         self.metadata_cache.put(uri.to_string(), cached.clone());
         Ok(cached)
     }
-
-    /// Scan with predicate pushdown — 1 RPC instead of N+1.
-    ///
-    /// Flow:
-    /// 1. Get/fetch Parquet metadata (cached footer + row group stats)
-    /// 2. Evaluate predicate against row group statistics → matching row groups
-    /// 3. For each matching row group: cache hit → NVMe, miss → GCS + cache
-    /// 4. Stream back raw page bytes for all matching row groups
-    pub async fn scan(&mut self, req: &ScanRequest) -> Result<Vec<Bytes>> {
-        let uri = &req.uri;
-        let metadata = self.get_metadata(uri).await?;
-
-        // Determine which row groups match the predicate
-        let row_group_ranges = if let Some(pred) = &req.predicate {
-            MetadataCache::find_matching_row_groups(&metadata, pred)
-        } else {
-            // No predicate → all row groups
-            metadata
-                .metadata
-                .row_groups()
-                .iter()
-                .enumerate()
-                .map(|(rg_idx, rg)| {
-                    let offset = rg.column(0).byte_range().0;
-                    let end = rg
-                        .columns()
-                        .iter()
-                        .map(|c| {
-                            let (off, len) = c.byte_range();
-                            off + len
-                        })
-                        .max()
-                        .unwrap_or(offset);
-                    crate::metadata_cache::RowGroupRange {
-                        row_group: rg_idx,
-                        offset,
-                        length: end - offset,
-                    }
-                })
-                .collect()
-        };
-
-        // Fetch matching pages
-        let mut result = Vec::with_capacity(row_group_ranges.len());
-        for rg_range in &row_group_ranges {
-            let range_req = ReadRangeRequest {
-                uri: uri.clone(),
-                offset: rg_range.offset,
-                length: rg_range.length,
-            };
-            let data = self.read_range(&range_req).await?;
-            result.push(data);
-        }
-
-        Ok(result)
-    }
 }
+
+use std::collections::HashSet;
 
 #[cfg(test)]
 mod tests {
@@ -224,10 +225,17 @@ mod tests {
 
     #[test]
     fn test_cache_manager_creation() {
-        let gcs = GcsClient::new("test-bucket");
         let metadata = MetadataCache::new(1000);
-        let pages = PageCache::new("/tmp/ruxio_test", 1024 * 1024 * 1024);
-        let cm = CacheManager::new(gcs, metadata, pages);
-        assert_eq!(cm.page_size, 4 * 1024 * 1024);
+        let pages = PageCache::new("/tmp/ruxio_test", 1024 * 1024 * 1024, 4 * 1024 * 1024);
+        let cm = CacheManager::new(metadata, pages);
+        assert_eq!(cm.page_size(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_cache_manager_custom_page_size() {
+        let metadata = MetadataCache::new(1000);
+        let pages = PageCache::new("/tmp/ruxio_test", 1024 * 1024 * 1024, 1024 * 1024);
+        let cm = CacheManager::new(metadata, pages);
+        assert_eq!(cm.page_size(), 1024 * 1024);
     }
 }

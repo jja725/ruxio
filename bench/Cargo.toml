@@ -30,6 +30,10 @@ harness = false
 name = "frame_codec"
 harness = false
 
+[[bench]]
+name = "eviction_policy"
+harness = false
+
 [dependencies]
 ruxio-common = { workspace = true }
 ruxio-protocol = { workspace = true }

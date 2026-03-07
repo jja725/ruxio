@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
 
@@ -19,12 +19,28 @@ pub struct CachedPage {
     pub data: Option<Bytes>,
 }
 
+/// Per-file cache tracking.
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub file_id: String,
+    pub cached_pages: HashSet<u64>,
+    pub total_cached_bytes: u64,
+}
+
+/// Which eviction policy to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    /// CLOCK-Pro with second-chance promotion (hot/cold).
+    ClockPro,
+    /// Simple LRU with O(1) doubly-linked list.
+    Lru,
+}
+
 // ── Count-Min Sketch for TinyLFU ─────────────────────────────────────
 
 const CMS_DEPTH: usize = 4;
 const CMS_WIDTH: usize = 4096;
 
-/// Count-Min Sketch for estimating access frequency (TinyLFU).
 struct CountMinSketch {
     counters: [[u8; CMS_WIDTH]; CMS_DEPTH],
     total: u64,
@@ -77,59 +93,12 @@ impl CountMinSketch {
     }
 }
 
-// ── Bloom Filter ─────────────────────────────────────────────────────
-
-const BLOOM_SIZE_BITS: usize = 8192;
-const BLOOM_NUM_HASHES: usize = 5;
-
-/// Bloom filter for fast "is any page from this file cached?" checks.
-struct BloomFilter {
-    bits: Vec<u64>,
-}
-
-impl BloomFilter {
-    fn new() -> Self {
-        Self {
-            bits: vec![0; BLOOM_SIZE_BITS / 64],
-        }
-    }
-
-    fn insert(&mut self, key: &PageKey) {
-        for i in 0..BLOOM_NUM_HASHES {
-            let bit = self.hash_bit(key, i);
-            let word = bit / 64;
-            let offset = bit % 64;
-            self.bits[word] |= 1 << offset;
-        }
-    }
-
-    fn might_contain(&self, key: &PageKey) -> bool {
-        for i in 0..BLOOM_NUM_HASHES {
-            let bit = self.hash_bit(key, i);
-            let word = bit / 64;
-            let offset = bit % 64;
-            if self.bits[word] & (1 << offset) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn hash_bit(&self, key: &PageKey, seed: usize) -> usize {
-        let mut hasher = Xxh3DefaultBuilder.build_hasher();
-        key.hash(&mut hasher);
-        seed.hash(&mut hasher);
-        (hasher.finish() as usize) % BLOOM_SIZE_BITS
-    }
-}
-
-// ── CLOCK-Pro Entry ──────────────────────────────────────────────────
+// ── CLOCK-Pro state ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageStatus {
     Hot,
     Cold,
-    Test, // ghost entry — metadata only, no data
 }
 
 struct ClockEntry {
@@ -139,116 +108,420 @@ struct ClockEntry {
     size: u64,
 }
 
+struct ClockProState {
+    entries: Vec<ClockEntry>,
+    hand: usize,
+    pos: HashMap<PageKey, usize>,
+}
+
+impl ClockProState {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            hand: 0,
+            pos: HashMap::new(),
+        }
+    }
+
+    fn mark_accessed(&mut self, key: &PageKey) {
+        if let Some(&idx) = self.pos.get(key) {
+            self.entries[idx].referenced = true;
+        }
+    }
+
+    fn insert(&mut self, key: PageKey, size: u64) {
+        let idx = self.entries.len();
+        self.entries.push(ClockEntry {
+            key: key.clone(),
+            status: PageStatus::Cold,
+            referenced: true,
+            size,
+        });
+        self.pos.insert(key, idx);
+    }
+
+    /// Remove by key. Uses swap_remove for O(1).
+    fn remove_key(&mut self, key: &PageKey) {
+        if let Some(&idx) = self.pos.get(key) {
+            self.swap_remove(idx);
+        }
+    }
+
+    fn swap_remove(&mut self, idx: usize) -> ClockEntry {
+        let entry = self.entries.swap_remove(idx);
+        self.pos.remove(&entry.key);
+        if idx < self.entries.len() {
+            let moved_key = self.entries[idx].key.clone();
+            self.pos.insert(moved_key, idx);
+        }
+        if self.hand >= self.entries.len() && !self.entries.is_empty() {
+            self.hand = 0;
+        }
+        entry
+    }
+
+    /// Get the eviction victim key (the entry the clock hand evicts).
+    fn victim_key(&self) -> Option<&PageKey> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(&self.entries[self.hand % self.entries.len()].key)
+    }
+
+    /// Evict one entry, returning its key and size.
+    fn evict_one(&mut self) -> Option<(PageKey, u64)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        let max_iterations = self.entries.len() * 2;
+        for _ in 0..max_iterations {
+            if self.entries.is_empty() {
+                break;
+            }
+            self.hand %= self.entries.len();
+            let entry = &mut self.entries[self.hand];
+
+            if entry.referenced {
+                entry.referenced = false;
+                if entry.status == PageStatus::Cold {
+                    entry.status = PageStatus::Hot;
+                }
+                self.hand = (self.hand + 1) % self.entries.len().max(1);
+                continue;
+            }
+
+            let key = entry.key.clone();
+            let size = entry.size;
+            self.swap_remove(self.hand);
+            return Some((key, size));
+        }
+        None
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+// ── LRU state (O(1) index-based doubly-linked list) ──────────────────
+
+const NONE: usize = usize::MAX;
+
+struct LruNode {
+    key: PageKey,
+    size: u64,
+    prev: usize,
+    next: usize,
+}
+
+struct LruState {
+    nodes: Vec<LruNode>,
+    pos: HashMap<PageKey, usize>,
+    head: usize, // oldest → evict from here
+    tail: usize, // newest → insert here
+    free: Vec<usize>,
+}
+
+impl LruState {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            pos: HashMap::new(),
+            head: NONE,
+            tail: NONE,
+            free: Vec::new(),
+        }
+    }
+
+    fn mark_accessed(&mut self, key: &PageKey) {
+        if let Some(&idx) = self.pos.get(key) {
+            self.move_to_tail(idx);
+        }
+    }
+
+    fn insert(&mut self, key: PageKey, size: u64) {
+        let idx = if let Some(free_idx) = self.free.pop() {
+            self.nodes[free_idx] = LruNode {
+                key: key.clone(),
+                size,
+                prev: NONE,
+                next: NONE,
+            };
+            free_idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode {
+                key: key.clone(),
+                size,
+                prev: NONE,
+                next: NONE,
+            });
+            idx
+        };
+
+        self.pos.insert(key, idx);
+        self.push_tail(idx);
+    }
+
+    fn remove_key(&mut self, key: &PageKey) {
+        if let Some(&idx) = self.pos.get(key) {
+            self.unlink(idx);
+            self.pos.remove(key);
+            self.free.push(idx);
+        }
+    }
+
+    /// Get the eviction victim key (LRU = head of list).
+    fn victim_key(&self) -> Option<&PageKey> {
+        if self.head == NONE {
+            return None;
+        }
+        Some(&self.nodes[self.head].key)
+    }
+
+    /// Evict the LRU entry (head), returning its key and size.
+    fn evict_one(&mut self) -> Option<(PageKey, u64)> {
+        if self.head == NONE {
+            return None;
+        }
+        let idx = self.head;
+        let key = self.nodes[idx].key.clone();
+        let size = self.nodes[idx].size;
+        self.unlink(idx);
+        self.pos.remove(&key);
+        self.free.push(idx);
+        Some((key, size))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head == NONE
+    }
+
+    fn len(&self) -> usize {
+        self.pos.len()
+    }
+
+    // ── linked list operations ───────────────────────────────────────
+
+    fn unlink(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+
+        if prev != NONE {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+
+        if next != NONE {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+
+        self.nodes[idx].prev = NONE;
+        self.nodes[idx].next = NONE;
+    }
+
+    fn push_tail(&mut self, idx: usize) {
+        self.nodes[idx].prev = self.tail;
+        self.nodes[idx].next = NONE;
+
+        if self.tail != NONE {
+            self.nodes[self.tail].next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+    }
+
+    fn move_to_tail(&mut self, idx: usize) {
+        if idx == self.tail {
+            return; // already at tail
+        }
+        self.unlink(idx);
+        self.push_tail(idx);
+    }
+}
+
+// ── Unified eviction state ───────────────────────────────────────────
+
+enum EvictionState {
+    ClockPro(ClockProState),
+    Lru(LruState),
+}
+
+impl EvictionState {
+    fn mark_accessed(&mut self, key: &PageKey) {
+        match self {
+            Self::ClockPro(s) => s.mark_accessed(key),
+            Self::Lru(s) => s.mark_accessed(key),
+        }
+    }
+
+    fn insert(&mut self, key: PageKey, size: u64) {
+        match self {
+            Self::ClockPro(s) => s.insert(key, size),
+            Self::Lru(s) => s.insert(key, size),
+        }
+    }
+
+    fn remove_key(&mut self, key: &PageKey) {
+        match self {
+            Self::ClockPro(s) => s.remove_key(key),
+            Self::Lru(s) => s.remove_key(key),
+        }
+    }
+
+    fn victim_key(&self) -> Option<&PageKey> {
+        match self {
+            Self::ClockPro(s) => s.victim_key(),
+            Self::Lru(s) => s.victim_key(),
+        }
+    }
+
+    fn evict_one(&mut self) -> Option<(PageKey, u64)> {
+        match self {
+            Self::ClockPro(s) => s.evict_one(),
+            Self::Lru(s) => s.evict_one(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::ClockPro(s) => s.is_empty(),
+            Self::Lru(s) => s.is_empty(),
+        }
+    }
+}
+
 // ── Page Cache ───────────────────────────────────────────────────────
 
-/// Page cache with CLOCK-Pro eviction, TinyLFU admission, and Bloom filters.
+/// Page cache with configurable eviction (CLOCK-Pro or LRU) and TinyLFU admission.
+///
+/// Disk layout (Alluxio-style):
+/// ```text
+/// {root}/{page_size}/{bucket}/{url_safe_file_id}/{page_index}
+/// ```
 pub struct PageCache {
     root: PathBuf,
     max_bytes: u64,
     used_bytes: u64,
+    page_size: u64,
 
-    // Data storage
     pages: HashMap<PageKey, CachedPage>,
-
-    // CLOCK-Pro: circular buffer with hand
-    clock: Vec<ClockEntry>,
-    clock_hand: usize,
-
-    // TinyLFU admission
+    eviction: EvictionState,
     frequency_sketch: CountMinSketch,
-
-    // Bloom filters per file URI
-    file_bloom: HashMap<String, BloomFilter>,
+    files: HashMap<String, FileInfo>,
+    created_dirs: HashSet<PathBuf>,
 }
 
 impl PageCache {
-    pub fn new(root: impl Into<PathBuf>, max_bytes: u64) -> Self {
+    pub fn new(root: impl Into<PathBuf>, max_bytes: u64, page_size: u64) -> Self {
+        Self::with_policy(root, max_bytes, page_size, EvictionPolicy::ClockPro)
+    }
+
+    pub fn with_policy(
+        root: impl Into<PathBuf>,
+        max_bytes: u64,
+        page_size: u64,
+        policy: EvictionPolicy,
+    ) -> Self {
+        let eviction = match policy {
+            EvictionPolicy::ClockPro => EvictionState::ClockPro(ClockProState::new()),
+            EvictionPolicy::Lru => EvictionState::Lru(LruState::new()),
+        };
         Self {
             root: root.into(),
             max_bytes,
             used_bytes: 0,
+            page_size,
             pages: HashMap::new(),
-            clock: Vec::new(),
-            clock_hand: 0,
+            eviction,
             frequency_sketch: CountMinSketch::new(10 * CMS_WIDTH as u64),
-            file_bloom: HashMap::new(),
+            files: HashMap::new(),
+            created_dirs: HashSet::new(),
         }
     }
 
-    /// Quick Bloom filter check: might any page from this file be cached?
-    pub fn maybe_has_file(&self, file_uri: &str) -> bool {
-        self.file_bloom.contains_key(file_uri)
+    pub fn page_size(&self) -> u64 {
+        self.page_size
     }
 
-    /// Get the local file path for a page key.
+    pub fn has_file(&self, file_id: &str) -> bool {
+        self.files.contains_key(file_id)
+    }
+
     pub fn page_path(&self, key: &PageKey) -> PathBuf {
-        self.root.join(key.to_path_component())
+        self.root
+            .join(self.page_size.to_string())
+            .join(key.to_path_component())
     }
 
-    /// Write page data to disk and return the path.
-    /// Creates parent directories as needed.
-    pub fn write_page_to_disk(&self, key: &PageKey, data: &[u8]) -> std::io::Result<PathBuf> {
+    pub fn write_page_to_disk(&mut self, key: &PageKey, data: &[u8]) -> std::io::Result<PathBuf> {
         let path = self.page_path(key);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if self.created_dirs.insert(parent.to_path_buf()) {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         std::fs::write(&path, data)?;
         Ok(path)
     }
 
-    /// Used bytes in cache.
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes
     }
 
-    /// Maximum cache capacity.
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
 
-    fn evict_until_space(&mut self, needed: u64) {
-        while self.used_bytes + needed > self.max_bytes && !self.clock.is_empty() {
-            self.evict_one();
+    pub fn file_info(&self, file_id: &str) -> Option<&FileInfo> {
+        self.files.get(file_id)
+    }
+
+    fn track_file_add(&mut self, key: &PageKey, size: u64) {
+        let info = self
+            .files
+            .entry(key.file_id.clone())
+            .or_insert_with(|| FileInfo {
+                file_id: key.file_id.clone(),
+                cached_pages: HashSet::new(),
+                total_cached_bytes: 0,
+            });
+        if info.cached_pages.insert(key.page_index) {
+            info.total_cached_bytes += size;
         }
     }
 
-    fn evict_one(&mut self) {
-        if self.clock.is_empty() {
-            return;
+    fn track_file_remove(&mut self, key: &PageKey, size: u64) {
+        if let Some(info) = self.files.get_mut(&key.file_id) {
+            if info.cached_pages.remove(&key.page_index) {
+                info.total_cached_bytes = info.total_cached_bytes.saturating_sub(size);
+            }
+            if info.cached_pages.is_empty() {
+                self.files.remove(&key.file_id);
+            }
         }
+    }
 
-        let max_iterations = self.clock.len() * 2;
-        for _ in 0..max_iterations {
-            if self.clock.is_empty() {
+    fn evict_until_space(&mut self, needed: u64) {
+        while self.used_bytes + needed > self.max_bytes && !self.eviction.is_empty() {
+            if let Some((key, size)) = self.eviction.evict_one() {
+                if let Some(page) = self.pages.remove(&key) {
+                    self.used_bytes -= size;
+                    self.track_file_remove(&key, size);
+                    let _ = std::fs::remove_file(&page.local_path);
+                }
+            } else {
                 break;
             }
-            self.clock_hand %= self.clock.len();
-            let entry = &mut self.clock[self.clock_hand];
-
-            if entry.referenced {
-                // Second chance: clear reference bit, promote cold→hot
-                entry.referenced = false;
-                if entry.status == PageStatus::Cold {
-                    entry.status = PageStatus::Hot;
-                }
-                self.clock_hand = (self.clock_hand + 1) % self.clock.len().max(1);
-                continue;
-            }
-
-            // Evict this entry
-            let key = entry.key.clone();
-            let size = entry.size;
-            self.clock.remove(self.clock_hand);
-            if self.clock_hand >= self.clock.len() && !self.clock.is_empty() {
-                self.clock_hand = 0;
-            }
-
-            if let Some(page) = self.pages.remove(&key) {
-                self.used_bytes -= size;
-                // Delete file on disk (best effort)
-                let _ = std::fs::remove_file(&page.local_path);
-            }
-            return;
         }
     }
 }
@@ -258,19 +531,12 @@ impl Cache for PageCache {
     type Value = CachedPage;
 
     fn get(&mut self, key: &PageKey) -> Option<&CachedPage> {
-        // Always increment frequency for TinyLFU
         self.frequency_sketch.increment(key);
-
-        // Set referenced bit in CLOCK-Pro
-        if let Some(pos) = self.clock.iter().position(|e| e.key == *key) {
-            self.clock[pos].referenced = true;
-        }
-
+        self.eviction.mark_accessed(key);
         self.pages.get(key)
     }
 
     fn put(&mut self, key: PageKey, value: CachedPage) -> bool {
-        // Already cached? Update in place.
         if self.pages.contains_key(&key) {
             self.pages.insert(key, value);
             return true;
@@ -278,72 +544,40 @@ impl Cache for PageCache {
 
         let size = value.size;
 
-        // TinyLFU admission: check if new item frequency > eviction victim frequency
+        // TinyLFU admission
         self.frequency_sketch.increment(&key);
         let new_freq = self.frequency_sketch.estimate(&key);
 
         if self.used_bytes + size > self.max_bytes {
-            // Find the victim's frequency
-            if !self.clock.is_empty() {
-                // Scan for the first unreferenced entry as potential victim
-                let victim_freq = self
-                    .clock
-                    .iter()
-                    .filter(|e| !e.referenced && e.status != PageStatus::Test)
-                    .map(|e| self.frequency_sketch.estimate(&e.key))
-                    .min()
-                    .unwrap_or(0);
-
+            if let Some(victim_key) = self.eviction.victim_key() {
+                let victim_freq = self.frequency_sketch.estimate(victim_key);
                 if new_freq <= victim_freq {
-                    // Reject admission: new item is less frequent than victim
                     return false;
                 }
             }
-
-            // Evict to make space
             self.evict_until_space(size);
         }
 
-        // Admit the page
-        self.clock.push(ClockEntry {
-            key: key.clone(),
-            status: PageStatus::Cold, // new entries start cold
-            referenced: true,
-            size,
-        });
-
-        // Update Bloom filter for this file
-        self.file_bloom
-            .entry(key.file_uri.clone())
-            .or_insert_with(BloomFilter::new)
-            .insert(&key);
-
+        self.eviction.insert(key.clone(), size);
+        self.track_file_add(&key, size);
         self.used_bytes += size;
         self.pages.insert(key, value);
         true
     }
 
     fn contains(&self, key: &PageKey) -> bool {
-        // Fast path: check Bloom filter first
-        if let Some(bloom) = self.file_bloom.get(&key.file_uri) {
-            if !bloom.might_contain(key) {
-                return false;
-            }
+        if let Some(info) = self.files.get(&key.file_id) {
+            info.cached_pages.contains(&key.page_index)
         } else {
-            return false;
+            false
         }
-        self.pages.contains_key(key)
     }
 
     fn remove(&mut self, key: &PageKey) -> Option<CachedPage> {
-        if let Some(pos) = self.clock.iter().position(|e| e.key == *key) {
-            self.clock.remove(pos);
-            if self.clock_hand >= self.clock.len() && !self.clock.is_empty() {
-                self.clock_hand = 0;
-            }
-        }
+        self.eviction.remove_key(key);
         if let Some(page) = self.pages.remove(key) {
             self.used_bytes -= page.size;
+            self.track_file_remove(key, page.size);
             let _ = std::fs::remove_file(&page.local_path);
             Some(page)
         } else {
@@ -360,6 +594,8 @@ impl Cache for PageCache {
 mod tests {
     use super::*;
 
+    const TEST_PAGE_SIZE: u64 = 4 * 1024 * 1024;
+
     fn make_page(size: u64) -> CachedPage {
         CachedPage {
             local_path: PathBuf::from("/tmp/test"),
@@ -368,10 +604,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_page_cache_basic() {
-        let mut cache = PageCache::new("/tmp/ruxio_test", 1024 * 1024);
-        let key = PageKey::new("gs://b/f.parquet", 0, 0);
+    // Run the same tests for both policies
+    fn test_basic(policy: EvictionPolicy) {
+        let mut cache =
+            PageCache::with_policy("/tmp/ruxio_test", 1024 * 1024, TEST_PAGE_SIZE, policy);
+        let key = PageKey::new("gs://b/f.parquet", 0);
 
         assert!(!cache.contains(&key));
         assert!(cache.put(key.clone(), make_page(100)));
@@ -379,20 +616,16 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
-    #[test]
-    fn test_page_cache_eviction() {
-        let mut cache = PageCache::new("/tmp/ruxio_test", 200);
+    fn test_eviction(policy: EvictionPolicy) {
+        let mut cache = PageCache::with_policy("/tmp/ruxio_test", 200, TEST_PAGE_SIZE, policy);
 
-        // Fill cache
-        let k1 = PageKey::new("gs://b/f1.parquet", 0, 0);
-        let k2 = PageKey::new("gs://b/f2.parquet", 0, 0);
+        let k1 = PageKey::new("gs://b/f1.parquet", 0);
+        let k2 = PageKey::new("gs://b/f2.parquet", 0);
         cache.put(k1.clone(), make_page(100));
         cache.put(k2.clone(), make_page(100));
         assert_eq!(cache.used_bytes(), 200);
 
-        // Adding k3 should trigger eviction
-        let k3 = PageKey::new("gs://b/f3.parquet", 0, 0);
-        // Increment frequency of k3 a few times to pass TinyLFU
+        let k3 = PageKey::new("gs://b/f3.parquet", 0);
         for _ in 0..5 {
             cache.frequency_sketch.increment(&k3);
         }
@@ -400,25 +633,128 @@ mod tests {
         assert!(cache.used_bytes() <= 200);
     }
 
-    #[test]
-    fn test_bloom_filter_false_negative_free() {
-        let mut cache = PageCache::new("/tmp/ruxio_test", 1024 * 1024);
-        let key = PageKey::new("gs://b/f.parquet", 0, 0);
-        cache.put(key.clone(), make_page(100));
+    fn test_file_tracking(policy: EvictionPolicy) {
+        let mut cache =
+            PageCache::with_policy("/tmp/ruxio_test", 1024 * 1024, TEST_PAGE_SIZE, policy);
 
-        // Bloom filter must never have false negatives
-        assert!(cache.maybe_has_file("gs://b/f.parquet"));
+        let k1 = PageKey::new("gs://b/f.parquet", 0);
+        let k2 = PageKey::new("gs://b/f.parquet", 1);
+        cache.put(k1.clone(), make_page(100));
+        cache.put(k2.clone(), make_page(200));
+
+        let info = cache.file_info("gs://b/f.parquet").unwrap();
+        assert_eq!(info.cached_pages.len(), 2);
+        assert_eq!(info.total_cached_bytes, 300);
+
+        cache.remove(&k1);
+        let info = cache.file_info("gs://b/f.parquet").unwrap();
+        assert_eq!(info.cached_pages.len(), 1);
+
+        cache.remove(&k2);
+        assert!(cache.file_info("gs://b/f.parquet").is_none());
+    }
+
+    #[test]
+    fn test_clockpro_basic() {
+        test_basic(EvictionPolicy::ClockPro);
+    }
+
+    #[test]
+    fn test_clockpro_eviction() {
+        test_eviction(EvictionPolicy::ClockPro);
+    }
+
+    #[test]
+    fn test_clockpro_file_tracking() {
+        test_file_tracking(EvictionPolicy::ClockPro);
+    }
+
+    #[test]
+    fn test_lru_basic() {
+        test_basic(EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        test_eviction(EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn test_lru_file_tracking() {
+        test_file_tracking(EvictionPolicy::Lru);
+    }
+
+    #[test]
+    fn test_has_file() {
+        for policy in [EvictionPolicy::ClockPro, EvictionPolicy::Lru] {
+            let mut cache =
+                PageCache::with_policy("/tmp/ruxio_test", 1024 * 1024, TEST_PAGE_SIZE, policy);
+            let key = PageKey::new("gs://b/f.parquet", 0);
+            cache.put(key.clone(), make_page(100));
+
+            assert!(cache.has_file("gs://b/f.parquet"));
+            assert!(!cache.has_file("gs://b/other.parquet"));
+
+            cache.remove(&key);
+            assert!(!cache.has_file("gs://b/f.parquet"));
+        }
     }
 
     #[test]
     fn test_count_min_sketch() {
         let mut cms = CountMinSketch::new(1000);
-        let key = PageKey::new("gs://b/f.parquet", 0, 0);
+        let key = PageKey::new("gs://b/f.parquet", 0);
 
         assert_eq!(cms.estimate(&key), 0);
         cms.increment(&key);
         assert!(cms.estimate(&key) >= 1);
         cms.increment(&key);
         assert!(cms.estimate(&key) >= 2);
+    }
+
+    #[test]
+    fn test_page_size_accessor() {
+        let cache = PageCache::new("/tmp/ruxio_test", 1024, 1024 * 1024);
+        assert_eq!(cache.page_size(), 1024 * 1024);
+    }
+
+    #[test]
+    fn test_page_path_alluxio_layout() {
+        let cache = PageCache::new("/tmp/cache", 1024 * 1024, TEST_PAGE_SIZE);
+        let key = PageKey::new("test://file.parquet", 3);
+        let path = cache.page_path(&key);
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("/4194304/"));
+        assert!(path_str.ends_with("/3"));
+    }
+
+    #[test]
+    fn test_lru_ordering() {
+        let mut cache =
+            PageCache::with_policy("/tmp/ruxio_test", 300, TEST_PAGE_SIZE, EvictionPolicy::Lru);
+
+        let k1 = PageKey::new("gs://b/f1.parquet", 0);
+        let k2 = PageKey::new("gs://b/f2.parquet", 0);
+        let k3 = PageKey::new("gs://b/f3.parquet", 0);
+
+        cache.put(k1.clone(), make_page(100));
+        cache.put(k2.clone(), make_page(100));
+        cache.put(k3.clone(), make_page(100));
+        assert_eq!(cache.len(), 3);
+
+        // Access k1 — moves it to most recent
+        cache.get(&k1);
+
+        // Insert k4 — should evict k2 (oldest untouched)
+        let k4 = PageKey::new("gs://b/f4.parquet", 0);
+        for _ in 0..5 {
+            cache.frequency_sketch.increment(&k4);
+        }
+        cache.put(k4.clone(), make_page(100));
+
+        assert!(cache.contains(&k1), "k1 should survive (was accessed)");
+        assert!(!cache.contains(&k2), "k2 should be evicted (oldest)");
+        assert!(cache.contains(&k3), "k3 should survive");
+        assert!(cache.contains(&k4), "k4 should be inserted");
     }
 }

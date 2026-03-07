@@ -19,7 +19,7 @@ use ruxio_storage::cache_trait::Cache;
 use ruxio_storage::forwarding;
 use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::MetadataCache;
-use ruxio_storage::page_cache::{CachedPage, PageCache};
+use ruxio_storage::page_cache::{CachedPage, EvictionPolicy, PageCache};
 use ruxio_storage::page_key::PageKey;
 
 #[derive(Parser, Debug)]
@@ -61,12 +61,19 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
 
-    /// Populate cache with test data for benchmarking (100 x 4MB pages)
+    /// Page size in bytes (default 4MB)
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    page_size: u64,
+
+    /// Eviction policy: "clockpro" or "lru" (both use TinyLFU admission)
+    #[arg(long, default_value = "lru")]
+    eviction_policy: String,
+
+    /// Populate cache with test data for benchmarking (100 pages)
     #[arg(long, default_value_t = false)]
     bench_populate: bool,
 }
 
-const PAGE_SIZE: u64 = 4 * 1024 * 1024;
 const BENCH_NUM_PAGES: u64 = 100;
 
 /// Determine which thread owns a file URI.
@@ -78,7 +85,8 @@ fn owning_thread(uri: &str, num_threads: usize) -> usize {
 
 /// Populate cache only with pages that this thread owns.
 fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads: usize) {
-    let data = Bytes::from(vec![0xABu8; PAGE_SIZE as usize]);
+    let page_size = page_cache.page_size();
+    let data = Bytes::from(vec![0xABu8; page_size as usize]);
     let uri = "test://file.parquet";
     let owner = owning_thread(uri, num_threads);
 
@@ -87,13 +95,13 @@ fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads
     }
 
     for i in 0..BENCH_NUM_PAGES {
-        let key = PageKey::new(uri, 0, i * PAGE_SIZE);
+        let key = PageKey::new(uri, i);
         let local_path = page_cache
             .write_page_to_disk(&key, &data)
             .expect("failed to write bench page");
         let page = CachedPage {
             local_path,
-            size: PAGE_SIZE,
+            size: page_size,
             data: Some(data.clone()),
         };
         page_cache.put(key, page);
@@ -116,17 +124,32 @@ fn main() -> Result<()> {
 
     let addr = format!("{}:{}", args.bind, args.data_port);
     let threads = args.threads;
+    let page_size = args.page_size;
+    let eviction_policy = match args.eviction_policy.as_str() {
+        "clockpro" | "clock-pro" => EvictionPolicy::ClockPro,
+        "lru" => EvictionPolicy::Lru,
+        other => {
+            eprintln!("Unknown eviction policy: {other}. Use 'clockpro' or 'lru'.");
+            std::process::exit(1);
+        }
+    };
 
     info!("Starting ruxio-server");
     info!("  bind:         {addr}");
     info!("  threads:      {threads}");
     info!("  cache_dir:    {}", args.cache_dir);
     info!("  max_cache:    {} bytes", args.max_cache_bytes);
+    info!(
+        "  page_size:    {} bytes ({} MB)",
+        page_size,
+        page_size / (1024 * 1024)
+    );
+    info!("  eviction:     {:?}", eviction_policy);
     if args.bench_populate {
         info!(
             "  bench:        {} x {}MB pages (partitioned by hash)",
             BENCH_NUM_PAGES,
-            PAGE_SIZE / (1024 * 1024)
+            page_size / (1024 * 1024)
         );
     }
 
@@ -165,13 +188,18 @@ fn main() -> Result<()> {
                     std::fs::create_dir_all(&cache_dir).unwrap();
                     let gcs = GcsClient::new(&bucket);
                     let metadata_cache = MetadataCache::new(max_metadata_entries);
-                    let mut page_cache = PageCache::new(&cache_dir, per_thread_cache_bytes);
+                    let mut page_cache = PageCache::with_policy(
+                        &cache_dir,
+                        per_thread_cache_bytes,
+                        page_size,
+                        eviction_policy,
+                    );
 
                     if bench_populate {
                         populate_bench_data(&mut page_cache, thread_id, threads);
                     }
 
-                    let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
+                    let cache_manager = CacheManager::new(metadata_cache, page_cache);
 
                     let self_id = NodeId::new(&bind, data_port);
                     let discovery = if peers.is_empty() {
@@ -183,6 +211,7 @@ fn main() -> Result<()> {
 
                     let ctx = Rc::new(data::ThreadContext {
                         cache_manager: Rc::new(RefCell::new(cache_manager)),
+                        gcs: Rc::new(gcs),
                         membership: Rc::new(membership),
                         thread_id,
                         num_threads: threads,

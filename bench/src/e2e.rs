@@ -12,9 +12,8 @@ use ruxio_cluster::membership::{ClusterMembership, DiscoveryMode};
 use ruxio_cluster::ring::NodeId;
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::ReadRangeRequest;
-use ruxio_storage::cache::CacheManager;
+use ruxio_storage::cache::{CacheManager, RangeResult};
 use ruxio_storage::cache_trait::Cache;
-use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::MetadataCache;
 use ruxio_storage::page_cache::{CachedPage, PageCache};
 use ruxio_storage::page_key::PageKey;
@@ -26,15 +25,16 @@ const BASE_PORT: u16 = 19900;
 
 /// Pre-populate the page cache with test data on disk.
 fn populate_cache(page_cache: &mut PageCache) {
-    let data = Bytes::from(vec![0xABu8; PAGE_SIZE as usize]);
+    let page_size = page_cache.page_size();
+    let data = Bytes::from(vec![0xABu8; page_size as usize]);
     for i in 0..NUM_PAGES {
-        let key = PageKey::new("test://file.parquet", 0, i * PAGE_SIZE);
+        let key = PageKey::new("test://file.parquet", i);
         let local_path = page_cache
             .write_page_to_disk(&key, &data)
             .expect("failed to write test page to disk");
         let page = CachedPage {
             local_path,
-            size: PAGE_SIZE,
+            size: page_size,
             data: Some(data.clone()),
         };
         page_cache.put(key, page);
@@ -51,14 +51,14 @@ fn start_server_thread(port: u16, use_zero_copy: bool) {
             .unwrap();
         rt.block_on(async move {
             // Each server thread gets its own cache partition (thread-per-core, no sharing)
-            let gcs = GcsClient::new("test-bucket");
             let metadata_cache = MetadataCache::new(1000);
             let mut page_cache = PageCache::new(
                 format!("/tmp/ruxio_e2e_test/{port}"),
                 2 * 1024 * 1024 * 1024,
+                PAGE_SIZE,
             );
             populate_cache(&mut page_cache);
-            let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
+            let cache_manager = CacheManager::new(metadata_cache, page_cache);
             let self_id = NodeId::new("127.0.0.1", port);
             let membership =
                 ClusterMembership::new(self_id, 150, DiscoveryMode::Static { peers: vec![] });
@@ -85,7 +85,7 @@ fn start_server_thread(port: u16, use_zero_copy: bool) {
 async fn serve_connection(
     mut stream: monoio::net::TcpStream,
     cache_manager: Rc<RefCell<CacheManager>>,
-    membership: Rc<ClusterMembership>,
+    _membership: Rc<ClusterMembership>,
     use_zero_copy: bool,
 ) {
     let mut reader = FrameReader::new();
@@ -118,11 +118,11 @@ async fn serve_connection(
 
             // Zero-copy path
             if use_zero_copy {
-                let page_offset = (req.offset / PAGE_SIZE) * PAGE_SIZE;
-                if req.length == PAGE_SIZE && req.offset == page_offset {
+                let page_index = req.offset / PAGE_SIZE;
+                if req.length == PAGE_SIZE && req.offset == page_index * PAGE_SIZE {
                     let file_info = cache_manager
                         .borrow_mut()
-                        .get_page_file(&req.uri, page_offset);
+                        .get_page_file(&req.uri, page_index);
                     if let Some((file_path, file_size)) = file_info {
                         if zero_copy::send_file_to_socket(&file_path, file_size, rid, &mut stream)
                             .await
@@ -134,10 +134,10 @@ async fn serve_connection(
                 }
             }
 
-            // Buffered path
-            let result = cache_manager.borrow_mut().read_range(&req).await;
+            // Buffered path (cache-only, no GCS in bench)
+            let result = cache_manager.borrow_mut().read_range_cached(&req);
             match result {
-                Ok(data) => {
+                RangeResult::Hit(data) => {
                     let chunk = Frame::new_raw(MessageType::DataChunk, rid, data);
                     let (r, _) = stream.write_all(chunk.encode().to_vec()).await;
                     if r.is_err() {
@@ -149,7 +149,7 @@ async fn serve_connection(
                         return;
                     }
                 }
-                Err(_) => {
+                RangeResult::Miss { .. } => {
                     let done = Frame::done(rid);
                     let (r, _) = stream.write_all(done.encode().to_vec()).await;
                     if r.is_err() {
