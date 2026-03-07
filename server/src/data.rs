@@ -569,19 +569,30 @@ async fn handle_read_range(
     let page_index = req.offset / page_size;
 
     if owner_thread == ctx.thread_id {
-        // LOCAL — try zero-copy sendfile first
-        if req.length == page_size && req.offset == page_index * page_size {
+        // LOCAL — try zero-copy sendfile for any single-page read (full or partial)
+        let first_page = req.offset / page_size;
+        let last_page = (req.offset + req.length - 1) / page_size;
+
+        if first_page == last_page {
+            // Request fits within one page — use sendfile with offset
             let file_info = ctx
                 .cache_manager
                 .borrow_mut()
-                .get_page_file(&req.uri, page_index);
-            if let Some((file_path, file_size)) = file_info {
-                if zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream)
-                    .await
-                    .is_ok()
+                .get_page_file(&req.uri, first_page);
+            if let Some((file_path, _file_size)) = file_info {
+                let offset_in_page = req.offset - first_page * page_size;
+                if zero_copy::send_file_range_to_socket(
+                    &file_path,
+                    offset_in_page,
+                    req.length,
+                    request_id,
+                    stream,
+                )
+                .await
+                .is_ok()
                 {
                     let file_id: Arc<str> = Arc::from(req.uri.as_str());
-                    maybe_prefetch(ctx, &file_id, page_index);
+                    maybe_prefetch(ctx, &file_id, first_page);
                     return vec![];
                 }
             }

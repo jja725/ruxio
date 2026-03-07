@@ -1,9 +1,9 @@
 //! Zero-copy data transfer utilities.
 //!
-//! - `send_file_to_socket`: file → socket via sendfile (Linux) or read+write (macOS)
+//! - `send_file_to_socket`: full file → socket via sendfile (Linux) or read+write (macOS)
+//! - `send_file_range_to_socket`: partial file → socket via sendfile with offset
 //! - `send_bytes_to_socket`: Bytes → socket via IoBuf (zero userspace copies)
-//! - `IoBytes`: IoBuf adapter for `bytes::Bytes` — lets monoio read directly
-//!   from Bytes' backing memory without .to_vec() copies.
+//! - `IoBytes`: IoBuf adapter for `bytes::Bytes`
 
 use std::path::Path;
 
@@ -44,38 +44,34 @@ unsafe impl IoBuf for IoBytes {
     }
 }
 
-// ── Zero-copy send helpers ───────────────────────────────────────────
+// ── Frame header helper ──────────────────────────────────────────────
+
+fn data_chunk_header(request_id: u32, payload_len: usize) -> [u8; FRAME_HEADER_SIZE] {
+    let body_len = 5 + payload_len as u32; // type(1) + request_id(4) + payload
+    let mut header = [0u8; FRAME_HEADER_SIZE];
+    header[0..4].copy_from_slice(&body_len.to_be_bytes());
+    header[4] = MessageType::DataChunk as u8;
+    header[5..9].copy_from_slice(&request_id.to_be_bytes());
+    header
+}
+
+// ── Zero-copy send: Bytes → socket ───────────────────────────────────
 
 /// Send raw Bytes as a DataChunk frame + Done frame — zero userspace copies.
-///
-/// Data path:
-///   Bytes (Arc-backed) → IoBytes adapter → monoio write_all
-///   → kernel reads directly from Bytes' memory → socket
-///
-/// No .to_vec(), no memcpy. The kernel accesses the same memory
-/// that Bytes points to.
 pub async fn send_bytes_to_socket(
     data: Bytes,
     request_id: u32,
     stream: &mut TcpStream,
 ) -> std::io::Result<()> {
-    // Build and send the 9-byte DataChunk header
-    let body_len = 5 + data.len() as u32; // type(1) + request_id(4) + payload
-    let mut header = [0u8; FRAME_HEADER_SIZE];
-    header[0..4].copy_from_slice(&body_len.to_be_bytes());
-    header[4] = MessageType::DataChunk as u8;
-    header[5..9].copy_from_slice(&request_id.to_be_bytes());
-
+    let header = data_chunk_header(request_id, data.len());
     let (result, _) = stream.write_all(header.to_vec()).await;
     result?;
 
-    // Send payload — ZERO copies (IoBytes lets kernel read from Bytes' backing memory)
     if !data.is_empty() {
         let (result, _) = stream.write_all(IoBytes::new(data)).await;
         result?;
     }
 
-    // Send Done frame
     let done = Frame::done(request_id);
     let (result, _) = stream.write_all(done.encode().to_vec()).await;
     result?;
@@ -90,12 +86,7 @@ pub async fn send_data_chunk(
     request_id: u32,
     stream: &mut TcpStream,
 ) -> std::io::Result<()> {
-    let body_len = 5 + data.len() as u32;
-    let mut header = [0u8; FRAME_HEADER_SIZE];
-    header[0..4].copy_from_slice(&body_len.to_be_bytes());
-    header[4] = MessageType::DataChunk as u8;
-    header[5..9].copy_from_slice(&request_id.to_be_bytes());
-
+    let header = data_chunk_header(request_id, data.len());
     let (result, _) = stream.write_all(header.to_vec()).await;
     result?;
 
@@ -107,27 +98,45 @@ pub async fn send_data_chunk(
     Ok(())
 }
 
+// ── Zero-copy send: file → socket (full file) ────────────────────────
+
 /// Send a cached page file to a TCP socket with zero-copy where possible.
-///
-/// Writes a DataChunk frame header, then sends the file contents, then Done.
+/// Sends the entire file as a DataChunk frame + Done.
 pub async fn send_file_to_socket(
     file_path: &Path,
     file_size: u64,
     request_id: u32,
     stream: &mut TcpStream,
 ) -> std::io::Result<u64> {
-    // Write DataChunk frame header
-    let body_len = 5 + file_size as usize; // type(1) + request_id(4) + payload
-    let mut header = [0u8; FRAME_HEADER_SIZE];
-    header[0..4].copy_from_slice(&(body_len as u32).to_be_bytes());
-    header[4] = MessageType::DataChunk as u8;
-    header[5..9].copy_from_slice(&request_id.to_be_bytes());
+    send_file_range_to_socket(file_path, 0, file_size, request_id, stream).await
+}
 
+// ── Zero-copy send: file range → socket (partial page) ───────────────
+
+/// Send a byte range from a file to a TCP socket with zero-copy.
+///
+/// Uses sendfile(2) with offset on Linux — the kernel reads the specified
+/// slice directly from the file's page cache into the socket buffer.
+/// No userspace buffer, no memcpy.
+///
+/// Example: page file is 4MB, engine wants bytes 1MB-2.2MB of the page:
+///   send_file_range_to_socket(path, offset=1MB, length=1.2MB, ...)
+///   → sendfile(socket_fd, file_fd, &offset=1MB, count=1.2MB)
+///   → kernel reads [1MB..2.2MB] from page cache → TCP socket
+pub async fn send_file_range_to_socket(
+    file_path: &Path,
+    file_offset: u64,
+    length: u64,
+    request_id: u32,
+    stream: &mut TcpStream,
+) -> std::io::Result<u64> {
+    // Write DataChunk frame header
+    let header = data_chunk_header(request_id, length as usize);
     let (result, _) = stream.write_all(header.to_vec()).await;
     result?;
 
-    // Transfer file contents
-    let transferred = send_file_contents(file_path, file_size, stream).await?;
+    // Transfer file range
+    let transferred = send_file_range_contents(file_path, file_offset, length, stream).await?;
 
     // Write Done frame
     let done = Frame::done(request_id);
@@ -137,11 +146,12 @@ pub async fn send_file_to_socket(
     Ok(transferred)
 }
 
-/// Linux: use sendfile(2) for zero-copy file → socket.
+/// Linux: use sendfile(2) with offset for zero-copy file range → socket.
 #[cfg(target_os = "linux")]
-async fn send_file_contents(
+async fn send_file_range_contents(
     file_path: &Path,
-    file_size: u64,
+    file_offset: u64,
+    length: u64,
     stream: &mut TcpStream,
 ) -> std::io::Result<u64> {
     use std::os::unix::io::AsRawFd;
@@ -150,8 +160,8 @@ async fn send_file_contents(
     let file_fd = file.as_raw_fd();
     let socket_fd = stream.as_raw_fd();
 
-    let mut offset: libc::off_t = 0;
-    let mut remaining = file_size as usize;
+    let mut offset = file_offset as libc::off_t;
+    let mut remaining = length as usize;
     let mut transferred: u64 = 0;
 
     while remaining > 0 {
@@ -174,16 +184,22 @@ async fn send_file_contents(
     Ok(transferred)
 }
 
-/// macOS fallback: read file into buffer, write to socket.
+/// macOS fallback: read file range into buffer, write to socket.
 #[cfg(not(target_os = "linux"))]
-async fn send_file_contents(
+async fn send_file_range_contents(
     file_path: &Path,
-    _file_size: u64,
+    file_offset: u64,
+    length: u64,
     stream: &mut TcpStream,
 ) -> std::io::Result<u64> {
-    let data = std::fs::read(file_path)?;
-    let len = data.len() as u64;
-    let (result, _) = stream.write_all(data).await;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(file_path)?;
+    file.seek(SeekFrom::Start(file_offset))?;
+    let mut buf = vec![0u8; length as usize];
+    file.read_exact(&mut buf)?;
+    let len = buf.len() as u64;
+    let (result, _) = stream.write_all(buf).await;
     result?;
     Ok(len)
 }
