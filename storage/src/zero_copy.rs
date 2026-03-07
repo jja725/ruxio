@@ -113,16 +113,18 @@ pub async fn send_file_to_socket(
 
 // ── Zero-copy send: file range → socket (partial page) ───────────────
 
+/// A slice of a page file to send via sendfile.
+pub struct FileSlice<'a> {
+    pub path: &'a Path,
+    pub offset: u64,
+    pub length: u64,
+}
+
 /// Send a byte range from a file to a TCP socket with zero-copy.
 ///
 /// Uses sendfile(2) with offset on Linux — the kernel reads the specified
 /// slice directly from the file's page cache into the socket buffer.
 /// No userspace buffer, no memcpy.
-///
-/// Example: page file is 4MB, engine wants bytes 1MB-2.2MB of the page:
-///   send_file_range_to_socket(path, offset=1MB, length=1.2MB, ...)
-///   → sendfile(socket_fd, file_fd, &offset=1MB, count=1.2MB)
-///   → kernel reads [1MB..2.2MB] from page cache → TCP socket
 pub async fn send_file_range_to_socket(
     file_path: &Path,
     file_offset: u64,
@@ -144,6 +146,47 @@ pub async fn send_file_range_to_socket(
     result?;
 
     Ok(transferred)
+}
+
+/// Send multiple file slices as a single DataChunk frame + Done.
+///
+/// Writes one DataChunk header with total_length, then sendfiles each slice
+/// in order. The TCP stream concatenates them on the wire — the client
+/// receives one contiguous DataChunk.
+///
+/// Example: request spans 3 pages:
+///   slices = [
+///     (page_0, offset=3MB, len=1MB),  ← tail of page 0
+///     (page_1, offset=0,   len=4MB),  ← full page 1
+///     (page_2, offset=0,   len=1MB),  ← head of page 2
+///   ]
+///   → 1 DataChunk header (6MB) + 3 sendfile calls = zero userspace copies
+pub async fn send_file_slices_to_socket(
+    slices: &[FileSlice<'_>],
+    request_id: u32,
+    stream: &mut TcpStream,
+) -> std::io::Result<u64> {
+    let total_length: u64 = slices.iter().map(|s| s.length).sum();
+
+    // Write single DataChunk header for the combined payload
+    let header = data_chunk_header(request_id, total_length as usize);
+    let (result, _) = stream.write_all(header.to_vec()).await;
+    result?;
+
+    // Sendfile each slice — kernel concatenates on the wire
+    let mut total_transferred = 0u64;
+    for slice in slices {
+        let transferred =
+            send_file_range_contents(slice.path, slice.offset, slice.length, stream).await?;
+        total_transferred += transferred;
+    }
+
+    // Done frame
+    let done = Frame::done(request_id);
+    let (result, _) = stream.write_all(done.encode().to_vec()).await;
+    result?;
+
+    Ok(total_transferred)
 }
 
 /// Linux: use sendfile(2) with offset for zero-copy file range → socket.

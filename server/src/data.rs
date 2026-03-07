@@ -569,32 +569,53 @@ async fn handle_read_range(
     let page_index = req.offset / page_size;
 
     if owner_thread == ctx.thread_id {
-        // LOCAL — try zero-copy sendfile for any single-page read (full or partial)
+        // LOCAL — try zero-copy sendfile for any cached range
         let first_page = req.offset / page_size;
         let last_page = (req.offset + req.length - 1) / page_size;
 
-        if first_page == last_page {
-            // Request fits within one page — use sendfile with offset
+        // Collect file paths for all pages in the range
+        let mut slices: Vec<(std::path::PathBuf, u64, u64)> = Vec::new(); // (path, offset_in_page, length)
+        let mut all_cached = true;
+
+        for page_idx in first_page..=last_page {
             let file_info = ctx
                 .cache_manager
                 .borrow_mut()
-                .get_page_file(&req.uri, first_page);
-            if let Some((file_path, _file_size)) = file_info {
-                let offset_in_page = req.offset - first_page * page_size;
-                if zero_copy::send_file_range_to_socket(
-                    &file_path,
-                    offset_in_page,
-                    req.length,
-                    request_id,
-                    stream,
-                )
+                .get_page_file(&req.uri, page_idx);
+            if let Some((file_path, file_size)) = file_info {
+                let page_start = page_idx * page_size;
+                let page_end = page_start + file_size;
+
+                // Compute the slice of this page that overlaps with the request
+                let slice_start = req.offset.max(page_start) - page_start;
+                let slice_end = (req.offset + req.length).min(page_end) - page_start;
+                let slice_len = slice_end - slice_start;
+
+                slices.push((file_path, slice_start, slice_len));
+            } else {
+                all_cached = false;
+                break;
+            }
+        }
+
+        if all_cached && !slices.is_empty() {
+            // All pages cached — sendfile each slice, zero userspace copies
+            let file_slices: Vec<zero_copy::FileSlice<'_>> = slices
+                .iter()
+                .map(|(path, offset, length)| zero_copy::FileSlice {
+                    path: path.as_path(),
+                    offset: *offset,
+                    length: *length,
+                })
+                .collect();
+
+            if zero_copy::send_file_slices_to_socket(&file_slices, request_id, stream)
                 .await
                 .is_ok()
-                {
-                    let file_id: Arc<str> = Arc::from(req.uri.as_str());
-                    maybe_prefetch(ctx, &file_id, first_page);
-                    return vec![];
-                }
+            {
+                let file_id: Arc<str> = Arc::from(req.uri.as_str());
+                maybe_prefetch(ctx, &file_id, last_page);
+                return vec![];
             }
         }
 
