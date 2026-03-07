@@ -2,17 +2,21 @@ mod control;
 mod data;
 
 use std::cell::RefCell;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
 use tracing::info;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
 use ruxio_cluster::membership::{ClusterMembership, DiscoveryMode};
 use ruxio_cluster::ring::NodeId;
 use ruxio_storage::cache::CacheManager;
 use ruxio_storage::cache_trait::Cache;
+use ruxio_storage::forwarding;
 use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::MetadataCache;
 use ruxio_storage::page_cache::{CachedPage, PageCache};
@@ -29,7 +33,7 @@ struct Args {
     #[arg(long, default_value_t = 51235)]
     health_port: u16,
 
-    /// Number of worker threads (defaults to number of CPUs)
+    /// Number of worker threads (defaults to 16)
     #[arg(long, default_value_t = 16)]
     threads: usize,
 
@@ -57,7 +61,7 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
 
-    /// Populate cache with test data for benchmarking (100 x 4MB pages per thread)
+    /// Populate cache with test data for benchmarking (100 x 4MB pages)
     #[arg(long, default_value_t = false)]
     bench_populate: bool,
 }
@@ -65,10 +69,25 @@ struct Args {
 const PAGE_SIZE: u64 = 4 * 1024 * 1024;
 const BENCH_NUM_PAGES: u64 = 100;
 
-fn populate_bench_data(page_cache: &mut PageCache) {
+/// Determine which thread owns a file URI.
+fn owning_thread(uri: &str, num_threads: usize) -> usize {
+    let mut hasher = Xxh3DefaultBuilder.build_hasher();
+    uri.hash(&mut hasher);
+    (hasher.finish() as usize) % num_threads
+}
+
+/// Populate cache only with pages that this thread owns.
+fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads: usize) {
     let data = Bytes::from(vec![0xABu8; PAGE_SIZE as usize]);
+    let uri = "test://file.parquet";
+    let owner = owning_thread(uri, num_threads);
+
+    if owner != thread_id {
+        return; // This thread doesn't own this file
+    }
+
     for i in 0..BENCH_NUM_PAGES {
-        let key = PageKey::new("test://file.parquet", 0, i * PAGE_SIZE);
+        let key = PageKey::new(uri, 0, i * PAGE_SIZE);
         let local_path = page_cache
             .write_page_to_disk(&key, &data)
             .expect("failed to write bench page");
@@ -79,13 +98,12 @@ fn populate_bench_data(page_cache: &mut PageCache) {
         };
         page_cache.put(key, page);
     }
+    info!(
+        "Thread {thread_id} populated {} pages (owns '{uri}')",
+        BENCH_NUM_PAGES
+    );
 }
 
-/// Server entry point.
-///
-/// Uses monoio's built-in multi-threading: each thread gets its own io_uring
-/// event loop and TcpListener on the same port (SO_REUSEPORT). The kernel
-/// distributes incoming connections across threads.
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -106,7 +124,7 @@ fn main() -> Result<()> {
     info!("  max_cache:    {} bytes", args.max_cache_bytes);
     if args.bench_populate {
         info!(
-            "  bench:        populating {} x {}MB pages per thread",
+            "  bench:        {} x {}MB pages (partitioned by hash)",
             BENCH_NUM_PAGES,
             PAGE_SIZE / (1024 * 1024)
         );
@@ -115,12 +133,14 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.cache_dir)?;
     let per_thread_cache_bytes = args.max_cache_bytes / threads as u64;
 
-    // Start health HTTP endpoint (memory stats)
+    // Start health HTTP endpoint
     let health_addr = format!("{}:{}", args.bind, args.health_port);
     control::start_health_server(health_addr);
 
-    // Spawn N monoio threads — each owns its own cache partition, listens on
-    // the same port via SO_REUSEPORT. The kernel distributes connections.
+    // Create inboxes for all threads (shared across threads for forwarding)
+    let inboxes: Vec<forwarding::Inbox> = (0..threads).map(|_| forwarding::new_inbox()).collect();
+
+    // Spawn worker threads
     let mut handles = Vec::new();
     for thread_id in 0..threads {
         let addr = addr.clone();
@@ -131,6 +151,7 @@ fn main() -> Result<()> {
         let bind = args.bind.clone();
         let data_port = args.data_port;
         let peers = args.peers.clone();
+        let inboxes = inboxes.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("ruxio-worker-{thread_id}"))
@@ -147,11 +168,10 @@ fn main() -> Result<()> {
                     let mut page_cache = PageCache::new(&cache_dir, per_thread_cache_bytes);
 
                     if bench_populate {
-                        populate_bench_data(&mut page_cache);
+                        populate_bench_data(&mut page_cache, thread_id, threads);
                     }
 
                     let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
-                    let cm = Rc::new(RefCell::new(cache_manager));
 
                     let self_id = NodeId::new(&bind, data_port);
                     let discovery = if peers.is_empty() {
@@ -160,17 +180,36 @@ fn main() -> Result<()> {
                         DiscoveryMode::Static { peers }
                     };
                     let membership = ClusterMembership::new(self_id, 150, discovery);
-                    let mem = Rc::new(membership);
+
+                    let ctx = Rc::new(data::ThreadContext {
+                        cache_manager: Rc::new(RefCell::new(cache_manager)),
+                        membership: Rc::new(membership),
+                        thread_id,
+                        num_threads: threads,
+                        inboxes: inboxes.clone(),
+                    });
+
+                    // Spawn inbox processor — drains forwarded lookup requests
+                    let inbox = inboxes[thread_id].clone();
+                    let ctx_inbox = ctx.clone();
+                    monoio::spawn(async move {
+                        loop {
+                            monoio::time::sleep(Duration::from_micros(50)).await;
+                            forwarding::process_inbox(
+                                &inbox,
+                                &mut ctx_inbox.cache_manager.borrow_mut().page_cache,
+                            );
+                        }
+                    });
 
                     let listener = monoio::net::TcpListener::bind(&addr).unwrap();
                     info!("Worker {thread_id} ready");
 
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
-                        let cm = cm.clone();
-                        let mem = mem.clone();
+                        let ctx = ctx.clone();
                         monoio::spawn(async move {
-                            data::serve_connection(stream, cm, mem).await;
+                            data::serve_connection(stream, ctx).await;
                         });
                     }
                 });
