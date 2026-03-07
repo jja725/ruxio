@@ -39,16 +39,6 @@ impl CachedParquetMeta {
     }
 }
 
-/// Metadata cache implementing the KV Cache trait.
-///
-/// Key = file URI (String), Value = CachedParquetMeta.
-/// Simple LRU eviction (metadata is small, CLOCK-Pro overkill).
-pub struct MetadataCache {
-    entries: HashMap<String, CachedParquetMeta>,
-    access_order: Vec<String>,
-    max_entries: usize,
-}
-
 /// Represents a byte range of a row group within a Parquet file.
 #[derive(Debug, Clone)]
 pub struct RowGroupRange {
@@ -57,11 +47,136 @@ pub struct RowGroupRange {
     pub length: u64,
 }
 
+// ── O(1) LRU via index-based doubly-linked list ──────────────────────
+
+const NONE: usize = usize::MAX;
+
+struct LruNode {
+    key: String,
+    prev: usize,
+    next: usize,
+}
+
+struct MetaLru {
+    nodes: Vec<LruNode>,
+    pos: HashMap<String, usize>,
+    head: usize,
+    tail: usize,
+    free: Vec<usize>,
+}
+
+impl MetaLru {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            pos: HashMap::new(),
+            head: NONE,
+            tail: NONE,
+            free: Vec::new(),
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(&idx) = self.pos.get(key) {
+            self.move_to_tail(idx);
+        }
+    }
+
+    fn insert(&mut self, key: String) {
+        let idx = if let Some(free_idx) = self.free.pop() {
+            self.nodes[free_idx] = LruNode {
+                key: key.clone(),
+                prev: NONE,
+                next: NONE,
+            };
+            free_idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode {
+                key: key.clone(),
+                prev: NONE,
+                next: NONE,
+            });
+            idx
+        };
+        self.pos.insert(key, idx);
+        self.push_tail(idx);
+    }
+
+    fn remove_key(&mut self, key: &str) {
+        if let Some(&idx) = self.pos.get(key) {
+            self.unlink(idx);
+            self.pos.remove(key);
+            self.free.push(idx);
+        }
+    }
+
+    fn evict_oldest(&mut self) -> Option<String> {
+        if self.head == NONE {
+            return None;
+        }
+        let idx = self.head;
+        let key = self.nodes[idx].key.clone();
+        self.unlink(idx);
+        self.pos.remove(&key);
+        self.free.push(idx);
+        Some(key)
+    }
+
+    fn unlink(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        if prev != NONE {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != NONE {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        self.nodes[idx].prev = NONE;
+        self.nodes[idx].next = NONE;
+    }
+
+    fn push_tail(&mut self, idx: usize) {
+        self.nodes[idx].prev = self.tail;
+        self.nodes[idx].next = NONE;
+        if self.tail != NONE {
+            self.nodes[self.tail].next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+    }
+
+    fn move_to_tail(&mut self, idx: usize) {
+        if idx == self.tail {
+            return;
+        }
+        self.unlink(idx);
+        self.push_tail(idx);
+    }
+}
+
+// ── Metadata Cache ───────────────────────────────────────────────────
+
+/// Metadata cache implementing the KV Cache trait.
+///
+/// Key = file URI (String), Value = CachedParquetMeta.
+/// O(1) LRU eviction via doubly-linked list + HashMap.
+pub struct MetadataCache {
+    entries: HashMap<String, CachedParquetMeta>,
+    lru: MetaLru,
+    max_entries: usize,
+}
+
 impl MetadataCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(max_entries),
-            access_order: Vec::with_capacity(max_entries),
+            lru: MetaLru::new(),
             max_entries,
         }
     }
@@ -69,9 +184,6 @@ impl MetadataCache {
     /// Evaluate a predicate against Parquet row group statistics.
     ///
     /// Returns byte ranges for row groups that potentially contain matching data.
-    /// This is the key optimization: instead of N+1 round-trips (1 metadata +
-    /// N page fetches), the engine sends 1 Scan RPC and ruxio evaluates the
-    /// predicate against cached stats, streaming back only matching pages.
     pub fn find_matching_row_groups(
         meta: &CachedParquetMeta,
         predicate: &ruxio_protocol::predicate::PredicateExpr,
@@ -116,7 +228,7 @@ impl MetadataCache {
                         return evaluate_stats_comparison(stats, op, value);
                     }
                 }
-                true // no stats or unknown column → assume match (safe)
+                true
             }
             PredicateExpr::And(left, right) => {
                 Self::row_group_might_match(meta, rg, left)
@@ -127,13 +239,10 @@ impl MetadataCache {
                     || Self::row_group_might_match(meta, rg, right)
             }
             PredicateExpr::Not(inner) => {
-                // NOT can't prune row groups safely with only min/max stats
-                // (a row group with min=1,max=10 could have NOT(col=5) matching)
                 let _ = inner;
                 true
             }
             PredicateExpr::In { column, values } => {
-                // Check if any value in the IN list falls within the row group's range
                 if let Some(col_idx) = find_column_index(meta, column) {
                     if let Some(stats) = rg.column(col_idx).statistics() {
                         return values.iter().any(|v| {
@@ -148,7 +257,6 @@ impl MetadataCache {
                 true
             }
             PredicateExpr::Between { column, low, high } => {
-                // BETWEEN is equivalent to (col >= low AND col <= high)
                 if let Some(col_idx) = find_column_index(meta, column) {
                     if let Some(stats) = rg.column(col_idx).statistics() {
                         let ge_low = evaluate_stats_comparison(
@@ -166,14 +274,7 @@ impl MetadataCache {
                 }
                 true
             }
-            PredicateExpr::IsNull { .. } => true, // can't prune with min/max stats
-        }
-    }
-
-    fn evict_oldest(&mut self) {
-        if let Some(oldest_key) = self.access_order.first().cloned() {
-            self.entries.remove(&oldest_key);
-            self.access_order.remove(0);
+            PredicateExpr::IsNull { .. } => true,
         }
     }
 }
@@ -184,9 +285,7 @@ impl Cache for MetadataCache {
 
     fn get(&mut self, key: &String) -> Option<&CachedParquetMeta> {
         if self.entries.contains_key(key) {
-            // Move to end of access order (most recent)
-            self.access_order.retain(|k| k != key);
-            self.access_order.push(key.clone());
+            self.lru.touch(key);
             self.entries.get(key)
         } else {
             None
@@ -195,10 +294,12 @@ impl Cache for MetadataCache {
 
     fn put(&mut self, key: String, value: CachedParquetMeta) -> bool {
         if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
-            self.evict_oldest();
+            if let Some(evicted) = self.lru.evict_oldest() {
+                self.entries.remove(&evicted);
+            }
         }
-        self.access_order.retain(|k| k != &key);
-        self.access_order.push(key.clone());
+        self.lru.remove_key(&key);
+        self.lru.insert(key.clone());
         self.entries.insert(key, value);
         true
     }
@@ -208,7 +309,7 @@ impl Cache for MetadataCache {
     }
 
     fn remove(&mut self, key: &String) -> Option<CachedParquetMeta> {
-        self.access_order.retain(|k| k != key);
+        self.lru.remove_key(key);
         self.entries.remove(key)
     }
 
@@ -276,7 +377,7 @@ fn evaluate_stats_comparison(
                 _ => true,
             }
         }
-        _ => true, // type mismatch or unsupported → assume match (safe)
+        _ => true,
     }
 }
 
@@ -286,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_metadata_cache_basic() {
-        let mut cache = MetadataCache::new(2);
+        let cache = MetadataCache::new(2);
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
     }
@@ -327,6 +428,49 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert!(!cache.contains(&"a".into()));
         assert!(cache.contains(&"b".into()));
+        assert!(cache.contains(&"c".into()));
+    }
+
+    #[test]
+    fn test_metadata_cache_lru_ordering() {
+        let mut cache = MetadataCache::new(2);
+
+        let make_meta = || CachedParquetMeta {
+            metadata: Arc::new(ParquetMetaData::new(
+                parquet::file::metadata::FileMetaData::new(
+                    0,
+                    0,
+                    None,
+                    None,
+                    Arc::new(parquet::schema::types::SchemaDescriptor::new(Arc::new(
+                        parquet::schema::types::Type::group_type_builder("schema")
+                            .build()
+                            .unwrap(),
+                    ))),
+                    None,
+                ),
+                Vec::new(),
+            )),
+            footer_bytes: bytes::Bytes::new(),
+            file_size: 1000,
+            etag: None,
+            cached_at: Instant::now(),
+            ttl: Duration::from_secs(300),
+        };
+
+        cache.put("a".into(), make_meta());
+        cache.put("b".into(), make_meta());
+
+        // Access "a" — makes it most recent
+        cache.get(&"a".into());
+
+        // Insert "c" — should evict "b" (now oldest), not "a"
+        cache.put("c".into(), make_meta());
+        assert!(
+            cache.contains(&"a".into()),
+            "a should survive (was accessed)"
+        );
+        assert!(!cache.contains(&"b".into()), "b should be evicted (oldest)");
         assert!(cache.contains(&"c".into()));
     }
 }

@@ -1,28 +1,29 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
 use crate::cache_trait::Cache;
 use crate::page_key::PageKey;
 
 /// A cached page on disk.
+///
+/// Data lives on NVMe/SSD only — the OS page cache handles the memory tier.
+/// This gives us full NVMe capacity without duplicating data in application RAM.
 #[derive(Debug, Clone)]
 pub struct CachedPage {
     /// Path to the cached page file on local NVMe/SSD.
     pub local_path: PathBuf,
     /// Size in bytes.
     pub size: u64,
-    /// The raw data (kept in memory for recently accessed pages, None if evicted to disk-only).
-    pub data: Option<Bytes>,
 }
 
 /// Per-file cache tracking.
 #[derive(Debug, Clone)]
 pub struct FileInfo {
-    pub file_id: String,
+    pub file_id: Arc<str>,
     pub cached_pages: HashSet<u64>,
     pub total_cached_bytes: u64,
 }
@@ -417,7 +418,7 @@ pub struct PageCache {
     pages: HashMap<PageKey, CachedPage>,
     eviction: EvictionState,
     frequency_sketch: CountMinSketch,
-    files: HashMap<String, FileInfo>,
+    files: HashMap<Arc<str>, FileInfo>,
     created_dirs: HashSet<PathBuf>,
 }
 
@@ -501,12 +502,12 @@ impl PageCache {
     }
 
     fn track_file_remove(&mut self, key: &PageKey, size: u64) {
-        if let Some(info) = self.files.get_mut(&key.file_id) {
+        if let Some(info) = self.files.get_mut(&*key.file_id) {
             if info.cached_pages.remove(&key.page_index) {
                 info.total_cached_bytes = info.total_cached_bytes.saturating_sub(size);
             }
             if info.cached_pages.is_empty() {
-                self.files.remove(&key.file_id);
+                self.files.remove(&*key.file_id);
             }
         }
     }
@@ -566,7 +567,7 @@ impl Cache for PageCache {
     }
 
     fn contains(&self, key: &PageKey) -> bool {
-        if let Some(info) = self.files.get(&key.file_id) {
+        if let Some(info) = self.files.get(&*key.file_id) {
             info.cached_pages.contains(&key.page_index)
         } else {
             false
@@ -600,7 +601,6 @@ mod tests {
         CachedPage {
             local_path: PathBuf::from("/tmp/test"),
             size,
-            data: Some(Bytes::from(vec![0u8; size as usize])),
         }
     }
 

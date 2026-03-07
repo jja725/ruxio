@@ -126,10 +126,19 @@ impl Frame {
         buf.freeze()
     }
 
-    /// Attempt to decode a frame from the buffer.
+    /// Encode just the 9-byte header (for scatter writes where payload is sent separately).
+    pub fn encode_header(&self) -> [u8; FRAME_HEADER_SIZE] {
+        let body_len = BODY_HEADER_SIZE + self.payload.len();
+        let mut header = [0u8; FRAME_HEADER_SIZE];
+        header[0..4].copy_from_slice(&(body_len as u32).to_be_bytes());
+        header[4] = self.msg_type as u8;
+        header[5..9].copy_from_slice(&self.request_id.to_be_bytes());
+        header
+    }
+
+    /// Attempt to decode a frame from the buffer (copies payload).
     ///
-    /// Returns `Ok(Some((frame, consumed)))` if a complete frame was decoded,
-    /// `Ok(None)` if more data is needed, or `Err` on protocol errors.
+    /// For zero-copy decode, use `FrameReader::next_frame()` instead.
     pub fn decode(buf: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
         if buf.len() < 4 {
             return Ok(None);
@@ -149,15 +158,10 @@ impl Frame {
             return Ok(None);
         }
 
-        let mut cursor = &buf[4..total_len];
-        let msg_type_byte = cursor[0];
-        cursor = &cursor[1..];
-
-        let msg_type = MessageType::from_u8(msg_type_byte)?;
-        let request_id = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-        cursor = &cursor[4..];
-
-        let payload = Bytes::copy_from_slice(cursor);
+        let cursor = &buf[4..total_len];
+        let msg_type = MessageType::from_u8(cursor[0])?;
+        let request_id = u32::from_be_bytes([cursor[1], cursor[2], cursor[3], cursor[4]]);
+        let payload = Bytes::copy_from_slice(&cursor[5..]);
 
         Ok(Some((
             Frame {
@@ -171,14 +175,28 @@ impl Frame {
 }
 
 /// Accumulates bytes from a stream and yields complete frames.
+///
+/// Uses `BytesMut::split_to` + `freeze` for zero-copy payload extraction —
+/// the payload `Bytes` shares the same underlying allocation as the read buffer,
+/// avoiding a 4MB copy for DataChunk frames.
 pub struct FrameReader {
     buf: BytesMut,
 }
 
+/// Default initial capacity — sized for typical page reads.
+const FRAME_READER_INITIAL_CAPACITY: usize = 4 * 1024 * 1024 + 1024;
+
 impl FrameReader {
     pub fn new() -> Self {
         Self {
-            buf: BytesMut::with_capacity(8192),
+            buf: BytesMut::with_capacity(FRAME_READER_INITIAL_CAPACITY),
+        }
+    }
+
+    /// Create with a specific initial capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: BytesMut::with_capacity(capacity),
         }
     }
 
@@ -187,15 +205,53 @@ impl FrameReader {
         self.buf.extend_from_slice(data);
     }
 
-    /// Try to extract the next complete frame.
+    /// Try to extract the next complete frame (zero-copy payload).
     pub fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
-        match Frame::decode(&self.buf)? {
-            Some((frame, consumed)) => {
-                self.buf.advance(consumed);
-                Ok(Some(frame))
-            }
-            None => Ok(None),
+        if self.buf.len() < 4 {
+            return Ok(None);
         }
+
+        let body_len =
+            u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+
+        if body_len > MAX_FRAME_SIZE {
+            return Err(FrameError::TooLarge {
+                size: body_len,
+                max: MAX_FRAME_SIZE,
+            });
+        }
+
+        let total_len = 4 + body_len;
+        if self.buf.len() < total_len {
+            return Ok(None);
+        }
+
+        // Split the complete frame out of the buffer
+        let mut frame_bytes = self.buf.split_to(total_len);
+
+        // Skip 4-byte length prefix
+        frame_bytes.advance(4);
+
+        // Parse header (5 bytes: type + request_id)
+        let msg_type = MessageType::from_u8(frame_bytes[0])?;
+        let request_id = u32::from_be_bytes([
+            frame_bytes[1],
+            frame_bytes[2],
+            frame_bytes[3],
+            frame_bytes[4],
+        ]);
+
+        // Skip body header
+        frame_bytes.advance(BODY_HEADER_SIZE);
+
+        // Zero-copy: freeze the remaining bytes as payload
+        let payload = frame_bytes.freeze();
+
+        Ok(Some(Frame {
+            msg_type,
+            request_id,
+            payload,
+        }))
     }
 }
 
@@ -222,6 +278,24 @@ mod tests {
 
         let (decoded, consumed) = Frame::decode(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.msg_type, MessageType::ReadRange);
+        assert_eq!(decoded.request_id, 42);
+        assert_eq!(decoded.payload, frame.payload);
+    }
+
+    #[test]
+    fn test_frame_reader_zero_copy() {
+        let req = ReadRangeRequest {
+            uri: "gs://bucket/file.parquet".into(),
+            offset: 0,
+            length: 1024,
+        };
+        let frame = Frame::new_json(MessageType::ReadRange, 42, &req);
+        let encoded = frame.encode();
+
+        let mut reader = FrameReader::new();
+        reader.feed(&encoded);
+        let decoded = reader.next_frame().unwrap().unwrap();
         assert_eq!(decoded.msg_type, MessageType::ReadRange);
         assert_eq!(decoded.request_id, 42);
         assert_eq!(decoded.payload, frame.payload);
@@ -269,5 +343,13 @@ mod tests {
         buf.put_u8(0xFF); // unknown type
         buf.put_u32(1); // request_id
         assert!(Frame::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn test_encode_header() {
+        let frame = Frame::done(42);
+        let header = frame.encode_header();
+        let encoded = frame.encode();
+        assert_eq!(&header[..], &encoded[..FRAME_HEADER_SIZE]);
     }
 }

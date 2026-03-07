@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use ruxio_storage::cache_trait::Cache;
 use ruxio_storage::page_cache::{CachedPage, PageCache};
@@ -15,7 +14,6 @@ fn make_page() -> CachedPage {
     CachedPage {
         local_path: PathBuf::from("/tmp/test"),
         size: 4096,
-        data: Some(Bytes::from_static(&[0u8; 64])), // small data for bench speed
     }
 }
 

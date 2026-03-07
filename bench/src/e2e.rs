@@ -26,7 +26,7 @@ const BASE_PORT: u16 = 19900;
 /// Pre-populate the page cache with test data on disk.
 fn populate_cache(page_cache: &mut PageCache) {
     let page_size = page_cache.page_size();
-    let data = Bytes::from(vec![0xABu8; page_size as usize]);
+    let data = vec![0xABu8; page_size as usize];
     for i in 0..NUM_PAGES {
         let key = PageKey::new("test://file.parquet", i);
         let local_path = page_cache
@@ -35,7 +35,6 @@ fn populate_cache(page_cache: &mut PageCache) {
         let page = CachedPage {
             local_path,
             size: page_size,
-            data: Some(data.clone()),
         };
         page_cache.put(key, page);
     }
@@ -88,6 +87,7 @@ async fn serve_connection(
     _membership: Rc<ClusterMembership>,
     use_zero_copy: bool,
 ) {
+    let _ = stream.set_nodelay(true);
     let mut reader = FrameReader::new();
     let mut buf = vec![0u8; 128 * 1024];
 
@@ -183,6 +183,7 @@ fn start_client_thread(
                 match TcpStream::connect(format!("127.0.0.1:{port}")).await {
                     Ok(s) => {
                         stream = s;
+                        let _ = stream.set_nodelay(true);
                         break;
                     }
                     Err(_) => {

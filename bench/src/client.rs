@@ -65,6 +65,7 @@ fn start_client_thread(
                 match TcpStream::connect(&server).await {
                     Ok(s) => {
                         stream = s;
+                        let _ = stream.set_nodelay(true);
                         break;
                     }
                     Err(e) => {

@@ -70,7 +70,6 @@ fn make_page() -> CachedPage {
     CachedPage {
         local_path: PathBuf::from("/tmp/test"),
         size: PAGE_SIZE,
-        data: None,
     }
 }
 

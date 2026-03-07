@@ -86,12 +86,12 @@ fn owning_thread(uri: &str, num_threads: usize) -> usize {
 /// Populate cache only with pages that this thread owns.
 fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads: usize) {
     let page_size = page_cache.page_size();
-    let data = Bytes::from(vec![0xABu8; page_size as usize]);
+    let data = vec![0xABu8; page_size as usize];
     let uri = "test://file.parquet";
     let owner = owning_thread(uri, num_threads);
 
     if owner != thread_id {
-        return; // This thread doesn't own this file
+        return;
     }
 
     for i in 0..BENCH_NUM_PAGES {
@@ -102,7 +102,6 @@ fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads
         let page = CachedPage {
             local_path,
             size: page_size,
-            data: Some(data.clone()),
         };
         page_cache.put(key, page);
     }
@@ -160,8 +159,8 @@ fn main() -> Result<()> {
     let health_addr = format!("{}:{}", args.bind, args.health_port);
     control::start_health_server(health_addr);
 
-    // Create inboxes for all threads (shared across threads for forwarding)
-    let inboxes: Vec<forwarding::Inbox> = (0..threads).map(|_| forwarding::new_inbox()).collect();
+    // Create SPSC channel matrix for lock-free cross-thread forwarding
+    let channels = forwarding::create_channel_matrix(threads);
 
     // Spawn worker threads
     let mut handles = Vec::new();
@@ -174,7 +173,7 @@ fn main() -> Result<()> {
         let bind = args.bind.clone();
         let data_port = args.data_port;
         let peers = args.peers.clone();
-        let inboxes = inboxes.clone();
+        let channels = channels.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("ruxio-worker-{thread_id}"))
@@ -215,17 +214,20 @@ fn main() -> Result<()> {
                         membership: Rc::new(membership),
                         thread_id,
                         num_threads: threads,
-                        inboxes: inboxes.clone(),
+                        channels: channels.clone(),
+                        inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
+                        access_tracker: Rc::new(RefCell::new(std::collections::HashMap::new())),
                     });
 
-                    // Spawn inbox processor — drains forwarded lookup requests
-                    let inbox = inboxes[thread_id].clone();
+                    // Spawn SPSC inbox processor — drains forwarded lookup requests
                     let ctx_inbox = ctx.clone();
                     monoio::spawn(async move {
                         loop {
-                            monoio::time::sleep(Duration::from_micros(50)).await;
-                            forwarding::process_inbox(
-                                &inbox,
+                            monoio::time::sleep(Duration::from_micros(10)).await;
+                            forwarding::process_forwarded_requests(
+                                &ctx_inbox.channels,
+                                thread_id,
+                                threads,
                                 &mut ctx_inbox.cache_manager.borrow_mut().page_cache,
                             );
                         }
