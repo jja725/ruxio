@@ -116,20 +116,14 @@ cargo run --release --bin ruxio-e2e -- 4 16 10
 
 ## Benchmark Results
 
-### Throughput (AMD EPYC 7B13, 4MB page reads)
+### Throughput (AMD EPYC 7B13, 32Gbps NIC, 4MB page reads, sendfile zero-copy)
 
-| Setup | Throughput | Bottleneck |
-|-------|-----------|------------|
-| 1 thread, loopback | 1.0 GB/s | Single-core CPU |
-| 4 threads, loopback, sendfile | 6.5 GB/s | - |
-| 4 threads, loopback, buffered | 3.9 GB/s | - |
-| 8 threads, loopback, sendfile | 7.5 GB/s | Loopback ceiling |
-| **32 conns, 32Gbps NIC, sendfile** | **3.6 GB/s (28.8 Gbps, 90%)** | **NIC** |
-| **64 conns, 32Gbps NIC, sendfile** | **3.68 GB/s (29.4 Gbps, 92%)** | **NIC** |
+| Connections | Throughput | NIC Utilization |
+|-------------|-----------|-----------------|
+| 32 | 3.6 GB/s (28.8 Gbps) | 90% |
+| 64 | 3.68 GB/s (29.4 Gbps) | 92% |
 
-sendfile zero-copy is **1.67x faster** than buffered I/O (6.5 vs 3.9 GB/s).
-
-Over a real 32Gbps NIC, ruxio saturates **92% of wire speed**. The software is not the bottleneck.
+Ruxio saturates **92% of wire speed** on a 32Gbps NIC. The software is not the bottleneck.
 
 ### Micro-benchmarks
 
