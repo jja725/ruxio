@@ -88,12 +88,38 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
 
 // ── Thundering herd ──────────────────────────────────────────────────
 
-async fn wait_for_inflight(ctx: &ThreadContext, key: &PageKey) {
+/// Maximum time to wait for an in-flight fetch before giving up.
+/// Prevents infinite wait if the fetching task panics or gets stuck.
+const INFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait for an in-flight fetch to complete, with timeout.
+/// Returns true if the fetch completed, false if timed out.
+async fn wait_for_inflight(ctx: &ThreadContext, key: &PageKey) -> bool {
+    let deadline = std::time::Instant::now() + INFLIGHT_TIMEOUT;
     loop {
         if !ctx.inflight.borrow().contains(key) {
-            return;
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Timed out — remove the stale inflight entry so it doesn't
+            // block future requests. The page will be re-fetched.
+            ctx.inflight.borrow_mut().remove(key);
+            return false;
         }
         monoio::time::sleep(Duration::from_micros(100)).await;
+    }
+}
+
+/// RAII guard that removes a PageKey from the inflight set on drop.
+/// Ensures cleanup even if the async task panics.
+struct InflightGuard {
+    inflight: Rc<RefCell<HashSet<PageKey>>>,
+    key: PageKey,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.borrow_mut().remove(&self.key);
     }
 }
 
@@ -131,12 +157,17 @@ fn maybe_prefetch(ctx: &Rc<ThreadContext>, file_id: &Arc<str>, current_page: u64
         let ctx = ctx.clone();
         let file_id = file_id.clone();
         monoio::spawn(async move {
+            // Guard ensures inflight entry is removed even on panic
+            let _guard = InflightGuard {
+                inflight: ctx.inflight.clone(),
+                key: key.clone(),
+            };
             let page_offset = prefetch_idx * page_size;
             let fetch_end = page_offset + page_size;
             if let Ok(data) = ctx.gcs.get_range(&file_id, page_offset..fetch_end).await {
                 ctx.cache_manager.borrow_mut().cache_page(&key, &data);
             }
-            ctx.inflight.borrow_mut().remove(&key);
+            // _guard dropped here → inflight.remove(&key)
         });
     }
 }
@@ -184,10 +215,20 @@ async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) -> Result<B
                 }
 
                 // Single coalesced GCS request
-                let data = ctx
+                let data = match ctx
                     .gcs
                     .get_range(&req.uri, range.start_offset..range.end_offset)
-                    .await?;
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // GCS fetch failed — remove all inflight entries
+                        for key in &needs_fetch {
+                            ctx.inflight.borrow_mut().remove(key);
+                        }
+                        return Err(e);
+                    }
+                };
 
                 // Split into pages, keep in memory for immediate return
                 for key in &needs_fetch {
@@ -197,14 +238,21 @@ async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) -> Result<B
                         let page_data = data.slice(start..end);
                         fetched.insert(key.page_index, page_data.clone());
 
-                        // Async cache to disk (fire-and-forget)
+                        // Async cache to disk with guard for cleanup
                         let cm = ctx.cache_manager.clone();
+                        let inflight = ctx.inflight.clone();
                         let key_owned = key.clone();
                         monoio::spawn(async move {
+                            let _guard = InflightGuard {
+                                inflight,
+                                key: key_owned.clone(),
+                            };
                             cm.borrow_mut().cache_page(&key_owned, &page_data);
+                            // _guard dropped → inflight.remove()
                         });
+                    } else {
+                        ctx.inflight.borrow_mut().remove(key);
                     }
-                    ctx.inflight.borrow_mut().remove(key);
                 }
             }
 
