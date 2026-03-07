@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use anyhow::Result;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::{TcpListener, TcpStream};
+use monoio::net::TcpStream;
 use tracing::{error, info, warn};
 
 use ruxio_cluster::membership::ClusterMembership;
@@ -12,50 +15,37 @@ use ruxio_protocol::messages::{
 use ruxio_storage::cache::CacheManager;
 use ruxio_storage::zero_copy;
 
-/// Serve the binary data plane on the given address.
-pub async fn serve_data_plane(
-    addr: &str,
-    mut cache_manager: CacheManager,
-    membership: ClusterMembership,
-) -> Result<()> {
-    let listener = TcpListener::bind(addr)?;
-    info!("Data plane listening on {addr}");
-
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        info!("New data plane connection from {peer_addr}");
-
-        if let Err(e) = handle_connection(stream, &mut cache_manager, &membership).await {
-            warn!("Connection error from {peer_addr}: {e}");
-        }
-    }
-}
-
-async fn handle_connection(
+/// Handle a single TCP connection.
+pub async fn serve_connection(
     mut stream: TcpStream,
-    cache_manager: &mut CacheManager,
-    membership: &ClusterMembership,
-) -> Result<()> {
+    cache_manager: Rc<RefCell<CacheManager>>,
+    membership: Rc<ClusterMembership>,
+) {
     let mut reader = FrameReader::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; 128 * 1024];
 
     loop {
         let (result, read_buf) = stream.read(buf).await;
         buf = read_buf;
-        let n = result?;
-        if n == 0 {
-            return Ok(());
-        }
-
+        let n = match result {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Read error: {e}");
+                return;
+            }
+        };
         reader.feed(&buf[..n]);
 
-        while let Some(frame) = reader.next_frame()? {
+        while let Some(frame) = reader.next_frame().unwrap() {
             let response_frames =
-                process_frame(frame, cache_manager, membership, &mut stream).await;
+                process_frame(frame, &cache_manager, &membership, &mut stream).await;
             for resp in response_frames {
                 let encoded = resp.encode();
                 let (result, _) = stream.write_all(encoded.to_vec()).await;
-                result?;
+                if result.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -63,8 +53,8 @@ async fn handle_connection(
 
 async fn process_frame(
     frame: Frame,
-    cache_manager: &mut CacheManager,
-    membership: &ClusterMembership,
+    cache_manager: &Rc<RefCell<CacheManager>>,
+    membership: &Rc<ClusterMembership>,
     stream: &mut TcpStream,
 ) -> Vec<Frame> {
     let request_id = frame.request_id;
@@ -102,25 +92,25 @@ async fn process_frame(
                 }
             }
 
-            // Serve range read — try zero-copy first, fall back to buffered
-            // Zero-copy: splice page file directly to socket (no userspace copy)
+            // Zero-copy path: sendfile for aligned 4MB reads
             let page_offset = (req.offset / (4 * 1024 * 1024)) * (4 * 1024 * 1024);
             if req.length == 4 * 1024 * 1024 && req.offset == page_offset {
-                // Aligned 4MB read — candidate for zero-copy
-                if let Some((file_path, file_size)) =
-                    cache_manager.get_page_file(&req.uri, page_offset)
-                {
-                    match zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream)
+                let file_info = cache_manager
+                    .borrow_mut()
+                    .get_page_file(&req.uri, page_offset);
+                if let Some((file_path, file_size)) = file_info {
+                    if zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream)
                         .await
+                        .is_ok()
                     {
-                        Ok(_) => return vec![], // already sent directly to socket
-                        Err(_) => {}            // fall through to buffered path
+                        return vec![];
                     }
                 }
             }
 
-            // Buffered path (non-aligned reads, cache misses, or splice failure)
-            match cache_manager.read_range(&req).await {
+            // Buffered path
+            let result = cache_manager.borrow_mut().read_range(&req).await;
+            match result {
                 Ok(data) => {
                     vec![
                         Frame::new_raw(MessageType::DataChunk, request_id, data),
@@ -157,7 +147,8 @@ async fn process_frame(
 
             let mut frames = Vec::new();
             for req in &batch_req.reads {
-                match cache_manager.read_range(req).await {
+                let result = cache_manager.borrow_mut().read_range(req).await;
+                match result {
                     Ok(data) => {
                         frames.push(Frame::new_raw(MessageType::DataChunk, request_id, data));
                     }
@@ -188,9 +179,9 @@ async fn process_frame(
                 }
             };
 
-            match cache_manager.get_metadata(&req.uri).await {
+            let result = cache_manager.borrow_mut().get_metadata(&req.uri).await;
+            match result {
                 Ok(meta) => {
-                    // Send metadata info frame, then raw footer bytes
                     let meta_resp = MetadataResponse {
                         uri: req.uri,
                         file_size: meta.file_size,
@@ -230,7 +221,6 @@ async fn process_frame(
                 }
             };
 
-            // Check consistent hash ring
             if !membership.is_local(&req.uri) {
                 if let Some(owner) = membership.owner(&req.uri) {
                     let parts: Vec<&str> = owner.0.split(':').collect();
@@ -247,7 +237,8 @@ async fn process_frame(
                 }
             }
 
-            match cache_manager.scan(&req).await {
+            let result = cache_manager.borrow_mut().scan(&req).await;
+            match result {
                 Ok(pages) => {
                     let mut frames = Vec::with_capacity(pages.len() + 1);
                     for page_data in pages {
@@ -290,7 +281,8 @@ async fn process_frame(
 
             let mut frames = Vec::new();
             for req in &batch_req.scans {
-                match cache_manager.scan(req).await {
+                let result = cache_manager.borrow_mut().scan(req).await;
+                match result {
                     Ok(pages) => {
                         for data in pages {
                             frames.push(Frame::new_raw(MessageType::DataChunk, request_id, data));

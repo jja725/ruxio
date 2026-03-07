@@ -105,7 +105,7 @@ fn main() {
     let host = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let base_port: u16 = std::env::args()
+    let port: u16 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(51234);
@@ -113,22 +113,16 @@ fn main() {
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
-    let num_server_threads: usize = std::env::args()
-        .nth(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
     let duration_secs: u64 = std::env::args()
-        .nth(5)
+        .nth(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
 
+    let server = format!("{host}:{port}");
+
     println!("=== Ruxio Benchmark Client ===");
     println!();
-    println!("  Server:       {host}:{base_port}");
-    println!(
-        "  Server ports: {base_port}-{}",
-        base_port + num_server_threads as u16 - 1
-    );
+    println!("  Server:       {server}");
     println!("  Connections:  {num_conns}");
     println!("  Duration:     {duration_secs}s");
     println!("  Page size:    {} MB", PAGE_SIZE / (1024 * 1024));
@@ -139,11 +133,9 @@ fn main() {
     let running = Arc::new(AtomicBool::new(false));
 
     println!("Connecting {num_conns} clients...");
-    for i in 0..num_conns {
-        let port = base_port + (i % num_server_threads) as u16;
-        let server = format!("{host}:{port}");
+    for _ in 0..num_conns {
         start_client_thread(
-            server,
+            server.clone(),
             total_bytes.clone(),
             total_ops.clone(),
             running.clone(),

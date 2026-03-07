@@ -1,6 +1,9 @@
 mod control;
 mod data;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
@@ -22,6 +25,10 @@ struct Args {
     #[arg(long, default_value_t = 51234)]
     data_port: u16,
 
+    /// Number of worker threads (defaults to number of CPUs)
+    #[arg(long, default_value_t = 16)]
+    threads: usize,
+
     /// GCS bucket name
     #[arg(long)]
     bucket: Option<String>,
@@ -30,7 +37,7 @@ struct Args {
     #[arg(long, default_value = "/tmp/ruxio_cache")]
     cache_dir: String,
 
-    /// Maximum cache size in bytes
+    /// Maximum cache size in bytes (total across all threads)
     #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
     max_cache_bytes: u64,
 
@@ -46,7 +53,7 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
 
-    /// Populate cache with test data for benchmarking (100 x 4MB pages)
+    /// Populate cache with test data for benchmarking (100 x 4MB pages per thread)
     #[arg(long, default_value_t = false)]
     bench_populate: bool,
 }
@@ -70,8 +77,14 @@ fn populate_bench_data(page_cache: &mut PageCache) {
     }
 }
 
-#[monoio::main(timer_enabled = true)]
-async fn main() -> Result<()> {
+/// Server entry point.
+///
+/// Uses monoio's built-in multi-threading: each thread gets its own io_uring
+/// event loop and TcpListener on the same port (SO_REUSEPORT). The kernel
+/// distributes incoming connections across threads.
+fn main() -> Result<()> {
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -79,57 +92,88 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let addr = format!("{}:{}", args.bind, args.data_port);
+    let threads = args.threads;
 
     info!("Starting ruxio-server");
-    info!("  data_port: {}", args.data_port);
-    info!("  cache_dir: {}", args.cache_dir);
-    info!("  max_cache: {} bytes", args.max_cache_bytes);
-
-    // Create cache directory
-    std::fs::create_dir_all(&args.cache_dir)?;
-
-    // Initialize components
-    let bucket = args.bucket.unwrap_or_default();
-    let gcs = GcsClient::new(&bucket);
-    let metadata_cache = MetadataCache::new(args.max_metadata_entries);
-    let mut page_cache = PageCache::new(&args.cache_dir, args.max_cache_bytes);
-
+    info!("  bind:         {addr}");
+    info!("  threads:      {threads}");
+    info!("  cache_dir:    {}", args.cache_dir);
+    info!("  max_cache:    {} bytes", args.max_cache_bytes);
     if args.bench_populate {
         info!(
-            "Populating cache with {} x {}MB test pages",
+            "  bench:        populating {} x {}MB pages per thread",
             BENCH_NUM_PAGES,
             PAGE_SIZE / (1024 * 1024)
         );
-        populate_bench_data(&mut page_cache);
-        info!("Cache populated");
     }
 
-    let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
+    std::fs::create_dir_all(&args.cache_dir)?;
+    let per_thread_cache_bytes = args.max_cache_bytes / threads as u64;
 
-    // Initialize cluster membership
-    let self_id = NodeId::new(&args.bind, args.data_port);
-    let discovery = if args.peers.is_empty() {
-        DiscoveryMode::Static { peers: vec![] }
-    } else {
-        DiscoveryMode::Static {
-            peers: args.peers.clone(),
-        }
-    };
-    let mut membership = ClusterMembership::new(self_id, 150, discovery);
-    membership.discover_peers().await?;
+    // Spawn N monoio threads — each owns its own cache partition, listens on
+    // the same port via SO_REUSEPORT. The kernel distributes connections.
+    let mut handles = Vec::new();
+    for thread_id in 0..threads {
+        let addr = addr.clone();
+        let cache_dir = format!("{}/{thread_id}", args.cache_dir);
+        let bucket = args.bucket.clone().unwrap_or_default();
+        let bench_populate = args.bench_populate;
+        let max_metadata_entries = args.max_metadata_entries;
+        let bind = args.bind.clone();
+        let data_port = args.data_port;
+        let peers = args.peers.clone();
 
-    info!(
-        "Cluster: {} nodes, self={}",
-        membership.ring().node_count(),
-        membership.self_id()
-    );
+        let handle = std::thread::Builder::new()
+            .name(format!("ruxio-worker-{thread_id}"))
+            .spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .unwrap();
 
-    // Start data plane listener
-    let data_addr = format!("{}:{}", args.bind, args.data_port);
-    info!("Data plane listening on {data_addr}");
+                rt.block_on(async move {
+                    std::fs::create_dir_all(&cache_dir).unwrap();
+                    let gcs = GcsClient::new(&bucket);
+                    let metadata_cache = MetadataCache::new(max_metadata_entries);
+                    let mut page_cache = PageCache::new(&cache_dir, per_thread_cache_bytes);
 
-    data::serve_data_plane(&data_addr, cache_manager, membership).await?;
+                    if bench_populate {
+                        populate_bench_data(&mut page_cache);
+                    }
 
+                    let cache_manager = CacheManager::new(gcs, metadata_cache, page_cache);
+                    let cm = Rc::new(RefCell::new(cache_manager));
+
+                    let self_id = NodeId::new(&bind, data_port);
+                    let discovery = if peers.is_empty() {
+                        DiscoveryMode::Static { peers: vec![] }
+                    } else {
+                        DiscoveryMode::Static { peers }
+                    };
+                    let membership = ClusterMembership::new(self_id, 150, discovery);
+                    let mem = Rc::new(membership);
+
+                    let listener = monoio::net::TcpListener::bind(&addr).unwrap();
+                    info!("Worker {thread_id} ready");
+
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let cm = cm.clone();
+                        let mem = mem.clone();
+                        monoio::spawn(async move {
+                            data::serve_connection(stream, cm, mem).await;
+                        });
+                    }
+                });
+            })?;
+        handles.push(handle);
+    }
+
+    info!("Server ready: {threads} threads on {addr}");
+
+    for h in handles {
+        h.join().unwrap();
+    }
     Ok(())
 }
