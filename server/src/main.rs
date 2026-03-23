@@ -1,5 +1,6 @@
 mod control;
 mod data;
+mod http;
 
 use std::cell::RefCell;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -32,6 +33,10 @@ struct Args {
     /// Health/stats HTTP port
     #[arg(long, default_value_t = 51235)]
     health_port: u16,
+
+    /// HTTP/1.1 data plane port (zero-copy sendfile)
+    #[arg(long, default_value_t = 51236)]
+    http_port: u16,
 
     /// Number of worker threads (defaults to 16)
     #[arg(long, default_value_t = 16)]
@@ -122,6 +127,7 @@ fn main() -> Result<()> {
         .init();
 
     let addr = format!("{}:{}", args.bind, args.data_port);
+    let http_addr = format!("{}:{}", args.bind, args.http_port);
     let threads = args.threads;
     let page_size = args.page_size;
     let eviction_policy = match args.eviction_policy.as_str() {
@@ -144,6 +150,7 @@ fn main() -> Result<()> {
         page_size / (1024 * 1024)
     );
     info!("  eviction:     {:?}", eviction_policy);
+    info!("  http_port:    {}", args.http_port);
     if args.bench_populate {
         info!(
             "  bench:        {} x {}MB pages (partitioned by hash)",
@@ -174,6 +181,7 @@ fn main() -> Result<()> {
         let data_port = args.data_port;
         let peers = args.peers.clone();
         let channels = channels.clone();
+        let http_addr = http_addr.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("ruxio-worker-{thread_id}"))
@@ -234,7 +242,20 @@ fn main() -> Result<()> {
                     });
 
                     let listener = monoio::net::TcpListener::bind(&addr).unwrap();
+                    let http_listener = monoio::net::TcpListener::bind(&http_addr).unwrap();
                     info!("Worker {thread_id} ready");
+
+                    // Spawn HTTP/1.1 listener
+                    let ctx_http = ctx.clone();
+                    monoio::spawn(async move {
+                        loop {
+                            let (stream, _) = http_listener.accept().await.unwrap();
+                            let ctx = ctx_http.clone();
+                            monoio::spawn(async move {
+                                http::serve_http_connection(stream, ctx).await;
+                            });
+                        }
+                    });
 
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();

@@ -17,6 +17,7 @@ A high-performance distributed cache for Parquet files on cloud storage (GCS), b
 ```
   Client ──HTTP/2──> Control Plane (cluster ops, health, metadata)
   Client ──Binary──> Data Plane   (range reads, predicate scans, page streaming)
+  Client ──HTTP/1.1> Data Plane   (range reads, metadata — zero-copy sendfile)
 
   [ruxio-node]  <--consistent hash ring (on file path)-->  [ruxio-node]
        |                                                        |
@@ -98,6 +99,20 @@ cargo run --release --bin ruxio-server -- \
   --threads 16
 ```
 
+The server starts three listeners:
+- **Binary data plane** on `--data-port` (default 51234)
+- **HTTP/1.1 data plane** on `--http-port` (default 51236)
+- **Health endpoint** on `--health-port` (default 51235)
+
+### HTTP/1.1 Data Plane
+
+The HTTP/1.1 endpoint supports zero-copy `sendfile` for cached data — no userspace buffer copies. On Linux, `TCP_CORK` coalesces the HTTP headers and sendfile payload into minimal TCP segments.
+
+```bash
+# Read a byte range (zero-copy sendfile on cache hit)
+curl -o data.bin 'http://localhost:51236/read?uri=gs://bucket/file.parquet&offset=0&length=4194304'
+```
+
 ### Benchmarks
 
 ```bash
@@ -159,6 +174,14 @@ Frame format:
 | Metadata | 0x08 | Response | Footer metadata |
 | Scan | 0x09 | Request | Predicate pushdown scan |
 | BatchScan | 0x0A | Request | Batch predicate scan |
+
+### HTTP/1.1 Data Plane (zero-copy sendfile)
+
+Standard HTTP/1.1 with `Connection: keep-alive`. Uses `sendfile(2)` to transfer cached page data directly from the OS page cache to the socket — no userspace copies.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/read?uri=...&offset=N&length=N` | GET | Read byte range (sendfile on cache hit) |
 
 ### Control Plane (HTTP/2)
 

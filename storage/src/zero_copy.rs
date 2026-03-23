@@ -191,7 +191,7 @@ pub async fn send_file_slices_to_socket(
 
 /// Linux: use sendfile(2) with offset for zero-copy file range → socket.
 #[cfg(target_os = "linux")]
-async fn send_file_range_contents(
+pub async fn send_file_range_contents(
     file_path: &Path,
     file_offset: u64,
     length: u64,
@@ -229,7 +229,7 @@ async fn send_file_range_contents(
 
 /// macOS fallback: read file range into buffer, write to socket.
 #[cfg(not(target_os = "linux"))]
-async fn send_file_range_contents(
+pub async fn send_file_range_contents(
     file_path: &Path,
     file_offset: u64,
     length: u64,

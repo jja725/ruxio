@@ -176,7 +176,7 @@ fn maybe_prefetch(ctx: &Rc<ThreadContext>, file_id: &Arc<str>, current_page: u64
 
 /// Read a byte range. On cache miss, fetches from GCS and returns data
 /// immediately — disk caching happens asynchronously in the background.
-async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) -> Result<Bytes> {
+pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) -> Result<Bytes> {
     let cache_result = ctx.cache_manager.borrow_mut().read_range_cached(req);
 
     match cache_result {
@@ -314,7 +314,7 @@ async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) -> Result<B
 }
 
 /// Fetch metadata with cache check.
-async fn get_metadata(ctx: &ThreadContext, uri: &str) -> Result<CachedParquetMeta> {
+pub(crate) async fn get_metadata(ctx: &ThreadContext, uri: &str) -> Result<CachedParquetMeta> {
     if let Some(meta) = ctx.cache_manager.borrow_mut().get_metadata_cached(uri) {
         return Ok(meta);
     }
