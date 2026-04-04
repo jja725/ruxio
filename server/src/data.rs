@@ -277,26 +277,44 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
             match reader.next_frame() {
                 Ok(Some(frame)) => {
                     let response_frames = process_frame(frame, &ctx, &mut stream).await;
-                    for resp in response_frames {
-                        // Watermark-based backpressure (hysteresis):
-                        if backpressured {
-                            while conn_bytes_pending > low_water {
-                                monoio::time::sleep(Duration::from_millis(1)).await;
-                                conn_bytes_pending = 0;
-                            }
-                            backpressured = false;
-                        } else if conn_bytes_pending >= high_water {
-                            backpressured = true;
+                    if response_frames.is_empty() {
+                        continue;
+                    }
+
+                    // Flush consolidation: encode all response frames into a
+                    // single buffer and write once, reducing syscalls.
+                    // For a typical ReadRange response (DataChunk + Done),
+                    // this turns 2 write() syscalls into 1.
+                    let mut batch = Vec::new();
+                    for resp in &response_frames {
+                        let encoded = resp.encode();
+                        batch.extend_from_slice(&encoded);
+                    }
+                    let batch_len = batch.len() as u64;
+
+                    // Watermark-based backpressure (hysteresis):
+                    if backpressured {
+                        while conn_bytes_pending > low_water {
                             monoio::time::sleep(Duration::from_millis(1)).await;
                             conn_bytes_pending = 0;
                         }
+                        backpressured = false;
+                    } else if conn_bytes_pending >= high_water {
+                        backpressured = true;
+                        monoio::time::sleep(Duration::from_millis(1)).await;
+                        conn_bytes_pending = 0;
+                    }
 
-                        match write_frame_with_timeout(&mut stream, resp, write_timeout).await {
-                            Ok(n) => conn_bytes_pending += n,
-                            Err(e) => {
-                                tracing::debug!("Write error: {e}");
-                                return;
-                            }
+                    // Single batched write with timeout
+                    match monoio::time::timeout(write_timeout, stream.write_all(batch)).await {
+                        Ok((Ok(_), _)) => conn_bytes_pending += batch_len,
+                        Ok((Err(e), _)) => {
+                            tracing::debug!("Write error: {e}");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!("Write timeout");
+                            return;
                         }
                     }
                 }
@@ -407,10 +425,11 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                 };
 
                 for key in &needs_fetch {
-                    let start = (key.page_index * page_size - range.start_offset) as usize;
-                    let end = (start + page_size as usize).min(data.len());
-                    if start < data.len() {
-                        let page_data = data.slice(start..end);
+                    let offset_in_range =
+                        (key.page_index * page_size).saturating_sub(range.start_offset) as usize;
+                    let end = (offset_in_range + page_size as usize).min(data.len());
+                    if offset_in_range < data.len() {
+                        let page_data = data.slice(offset_in_range..end);
                         fetched.insert(key.page_index, page_data.clone());
 
                         let cm = ctx.cache_manager.clone();
