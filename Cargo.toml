@@ -70,6 +70,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Signals
 ctrlc = "3"
 
+# Socket options
+socket2 = "0.5"
+
 # Misc
 lazy_static = "1.4"
 hostname = "0.4"

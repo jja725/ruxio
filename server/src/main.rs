@@ -151,6 +151,60 @@ fn restore_cache_index(page_cache: &mut PageCache, cache_dir: &str, page_size: u
     restored
 }
 
+/// Create a TCP listener with production socket options.
+///
+/// Uses socket2 for full control over:
+/// - SO_BACKLOG (default 1024, prevents dropped connections under burst)
+/// - SO_REUSEADDR (allows quick restart without TIME_WAIT)
+/// - TCP_FASTOPEN (saves 1 RTT on new connections, Linux only)
+fn create_listener(
+    addr: &str,
+    settings: &ruxio_common::settings::ServerSettings,
+) -> anyhow::Result<monoio::net::TcpListener> {
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid address {addr}: {e}"))?;
+
+    let socket = socket2::Socket::new(
+        if sock_addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    if settings.so_reuseaddr {
+        socket.set_reuse_address(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.set_nodelay(true)?;
+
+    // TCP_FASTOPEN (Linux only) — allows data in the SYN packet
+    #[cfg(target_os = "linux")]
+    if settings.tcp_fastopen {
+        // TCP_FASTOPEN is set on the *listening* socket with the queue length
+        let optval = settings.tcp_fastopen_qlen as libc::c_int;
+        unsafe {
+            libc::setsockopt(
+                std::os::unix::io::AsRawFd::as_raw_fd(&socket),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    socket.bind(&sock_addr.into())?;
+    socket.listen(settings.so_backlog as i32)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = monoio::net::TcpListener::from_std(std_listener)?;
+    Ok(listener)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -245,6 +299,8 @@ fn main() -> Result<()> {
         max_pending_requests: settings.server.max_pending_requests,
         response_chunk_bytes: settings.server.response_chunk_bytes,
         sendfile_timeout_secs: settings.server.sendfile_timeout_secs,
+        write_buffer_high: settings.server.write_buffer_high,
+        write_buffer_low: settings.server.write_buffer_low,
     };
 
     let retry_policy = RetryPolicy {
@@ -280,6 +336,7 @@ fn main() -> Result<()> {
         let etcd_prefix = settings.etcd_prefix.clone();
         let etcd_lease_ttl = settings.cluster.etcd_lease_ttl_secs;
         let vnodes = settings.cluster.vnodes_per_node;
+        let server_config_for_socket = settings.server.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("ruxio-worker-{thread_id}"))
@@ -395,7 +452,7 @@ fn main() -> Result<()> {
                         }
                     });
 
-                    let listener = match monoio::net::TcpListener::bind(&addr) {
+                    let listener = match create_listener(&addr, &server_config_for_socket) {
                         Ok(l) => l,
                         Err(e) => {
                             tracing::error!(
@@ -404,7 +461,8 @@ fn main() -> Result<()> {
                             return;
                         }
                     };
-                    let http_listener = match monoio::net::TcpListener::bind(&http_addr) {
+                    let http_listener = match create_listener(&http_addr, &server_config_for_socket)
+                    {
                         Ok(l) => l,
                         Err(e) => {
                             tracing::error!(

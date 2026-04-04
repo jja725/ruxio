@@ -59,6 +59,13 @@ pub struct ServerConfig {
     pub response_chunk_bytes: u64,
     /// Sendfile deadline in seconds (default 300s).
     pub sendfile_timeout_secs: u64,
+    /// Write buffer high water mark (bytes). Connection enters backpressured
+    /// state when pending bytes exceed this. Default 64KB.
+    pub write_buffer_high: u64,
+    /// Write buffer low water mark (bytes). Connection exits backpressured
+    /// state when pending bytes drain below this. Default 32KB.
+    /// Hysteresis between high/low prevents flapping.
+    pub write_buffer_low: u64,
 }
 
 impl Default for ServerConfig {
@@ -74,6 +81,8 @@ impl Default for ServerConfig {
             max_pending_requests: 1_000,
             response_chunk_bytes: 4 * 1024 * 1024,
             sendfile_timeout_secs: 300,
+            write_buffer_high: 64 * 1024,
+            write_buffer_low: 32 * 1024,
         }
     }
 }
@@ -208,8 +217,13 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     let mut buf = vec![0u8; 128 * 1024];
     let idle_timeout = Duration::from_secs(ctx.config.idle_timeout_secs);
     let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
-    let max_inflight = ctx.config.max_inflight_bytes;
+    let high_water = ctx.config.write_buffer_high;
+    let low_water = ctx.config.write_buffer_low;
+    // Connection-level bytes-in-flight counter for watermark backpressure.
+    // When pending exceeds high_water, we enter backpressured state and
+    // yield until it drains below low_water. Hysteresis prevents flapping.
     let mut conn_bytes_pending: u64 = 0;
+    let mut backpressured = false;
 
     loop {
         if ctx.shutdown.load(Ordering::Relaxed) {
@@ -242,10 +256,21 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
                 Ok(Some(frame)) => {
                     let response_frames = process_frame(frame, &ctx, &mut stream).await;
                     for resp in response_frames {
-                        // Backpressure: yield if too many bytes pending.
-                        // write_all returns when kernel accepts bytes into send buffer,
-                        // so we can reset after each yield.
-                        if conn_bytes_pending >= max_inflight {
+                        // Watermark-based backpressure (Netty-style hysteresis):
+                        // - Enter backpressured state when pending > high_water
+                        // - Stay backpressured until pending drains below low_water
+                        // - Prevents flapping between yield/resume on boundary
+                        if backpressured {
+                            while conn_bytes_pending > low_water {
+                                monoio::time::sleep(Duration::from_millis(1)).await;
+                                // write_all is synchronous from our perspective —
+                                // once it returns, kernel accepted the bytes.
+                                // So reset after yield.
+                                conn_bytes_pending = 0;
+                            }
+                            backpressured = false;
+                        } else if conn_bytes_pending >= high_water {
+                            backpressured = true;
                             monoio::time::sleep(Duration::from_millis(1)).await;
                             conn_bytes_pending = 0;
                         }

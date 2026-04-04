@@ -82,6 +82,23 @@ pub struct ServerSettings {
     /// Sendfile deadline in seconds. If a sendfile transfer takes longer
     /// than this, the connection is closed.
     pub sendfile_timeout_secs: u64,
+    /// TCP listen backlog (max pending connections queued by kernel).
+    /// Too small = dropped connections under burst. Default 1024.
+    pub so_backlog: u32,
+    /// Enable SO_REUSEADDR on server sockets. Default true.
+    pub so_reuseaddr: bool,
+    /// Enable TCP_FASTOPEN on server sockets (saves 1 RTT). Default true on Linux.
+    pub tcp_fastopen: bool,
+    /// TCP_FASTOPEN queue length. Only used if tcp_fastopen=true. Default 256.
+    pub tcp_fastopen_qlen: u32,
+    /// Write buffer high water mark (bytes). When pending bytes exceed this,
+    /// the connection enters backpressured state and pauses accepting new frames.
+    /// Inspired by Netty's WriteBufferWaterMark. Default 64KB.
+    pub write_buffer_high: u64,
+    /// Write buffer low water mark (bytes). When pending bytes drain below this,
+    /// the connection exits backpressured state and resumes. Default 32KB.
+    /// Must be < write_buffer_high. Hysteresis prevents flapping.
+    pub write_buffer_low: u64,
 }
 
 /// Cluster membership settings.
@@ -133,6 +150,12 @@ impl Default for ServerSettings {
             max_pending_requests: 1_000,
             response_chunk_bytes: 4 * 1024 * 1024, // 4MB chunks
             sendfile_timeout_secs: 300,
+            so_backlog: 1024,
+            so_reuseaddr: true,
+            tcp_fastopen: true,
+            tcp_fastopen_qlen: 256,
+            write_buffer_high: 64 * 1024, // 64KB
+            write_buffer_low: 32 * 1024,  // 32KB
         }
     }
 }
@@ -255,6 +278,24 @@ impl From<Config> for Settings {
             sendfile_timeout_secs: config
                 .get::<u64>("server.sendfile_timeout_secs")
                 .unwrap_or(server_defaults.sendfile_timeout_secs),
+            so_backlog: config
+                .get::<u32>("server.so_backlog")
+                .unwrap_or(server_defaults.so_backlog),
+            so_reuseaddr: config
+                .get::<bool>("server.so_reuseaddr")
+                .unwrap_or(server_defaults.so_reuseaddr),
+            tcp_fastopen: config
+                .get::<bool>("server.tcp_fastopen")
+                .unwrap_or(server_defaults.tcp_fastopen),
+            tcp_fastopen_qlen: config
+                .get::<u32>("server.tcp_fastopen_qlen")
+                .unwrap_or(server_defaults.tcp_fastopen_qlen),
+            write_buffer_high: config
+                .get::<u64>("server.write_buffer_high")
+                .unwrap_or(server_defaults.write_buffer_high),
+            write_buffer_low: config
+                .get::<u64>("server.write_buffer_low")
+                .unwrap_or(server_defaults.write_buffer_low),
         };
 
         let cluster_defaults = ClusterSettings::default();
