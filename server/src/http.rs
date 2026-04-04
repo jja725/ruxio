@@ -349,7 +349,9 @@ async fn handle_read(stream: &mut TcpStream, req: &HttpRequest, ctx: &Rc<ThreadC
             }
             if !data.is_empty() {
                 let (result, _) = stream.write_all(IoBytes::new(data)).await;
-                let _ = result;
+                if let Err(e) = result {
+                    tracing::debug!("HTTP write error: {e}");
+                }
             }
         }
         Err(e) => {

@@ -72,6 +72,16 @@ pub struct ServerSettings {
     pub idle_timeout_secs: u64,
     pub max_inflight_bytes: u64,
     pub max_connections_per_thread: u32,
+    /// Per-write timeout in seconds (prevents blocking on stalled clients).
+    pub write_timeout_secs: u64,
+    /// Max pending requests per thread before rejecting with RESOURCE_EXHAUSTED.
+    pub max_pending_requests: u32,
+    /// Response chunk size for large reads (bytes). Large responses are split
+    /// into chunks of this size to enable backpressure between chunks.
+    pub response_chunk_bytes: u64,
+    /// Sendfile deadline in seconds. If a sendfile transfer takes longer
+    /// than this, the connection is closed.
+    pub sendfile_timeout_secs: u64,
 }
 
 /// Cluster membership settings.
@@ -119,6 +129,10 @@ impl Default for ServerSettings {
             idle_timeout_secs: 300,
             max_inflight_bytes: 64 * 1024 * 1024,
             max_connections_per_thread: 10_000,
+            write_timeout_secs: 60,
+            max_pending_requests: 1_000,
+            response_chunk_bytes: 4 * 1024 * 1024, // 4MB chunks
+            sendfile_timeout_secs: 300,
         }
     }
 }
@@ -229,6 +243,18 @@ impl From<Config> for Settings {
             max_connections_per_thread: config
                 .get::<u32>("server.max_connections_per_thread")
                 .unwrap_or(server_defaults.max_connections_per_thread),
+            write_timeout_secs: config
+                .get::<u64>("server.write_timeout_secs")
+                .unwrap_or(server_defaults.write_timeout_secs),
+            max_pending_requests: config
+                .get::<u32>("server.max_pending_requests")
+                .unwrap_or(server_defaults.max_pending_requests),
+            response_chunk_bytes: config
+                .get::<u64>("server.response_chunk_bytes")
+                .unwrap_or(server_defaults.response_chunk_bytes),
+            sendfile_timeout_secs: config
+                .get::<u64>("server.sendfile_timeout_secs")
+                .unwrap_or(server_defaults.sendfile_timeout_secs),
         };
 
         let cluster_defaults = ClusterSettings::default();

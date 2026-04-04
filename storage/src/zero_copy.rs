@@ -189,7 +189,9 @@ pub async fn send_file_slices_to_socket(
     Ok(total_transferred)
 }
 
-/// Linux: use sendfile(2) with offset for zero-copy file range → socket.
+/// Linux: use sendfile(2) with offset for zero-copy file range to socket.
+/// Includes a deadline to prevent infinite blocking on stalled connections,
+/// and exponential backoff on EWOULDBLOCK (1us -> 1ms cap).
 #[cfg(target_os = "linux")]
 pub async fn send_file_range_contents(
     file_path: &Path,
@@ -206,13 +208,27 @@ pub async fn send_file_range_contents(
     let mut offset = file_offset as libc::off_t;
     let mut remaining = length as usize;
     let mut transferred: u64 = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut stall_count: u32 = 0;
 
     while remaining > 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "sendfile deadline exceeded: {}B of {}B transferred",
+                    transferred, length
+                ),
+            ));
+        }
+
         let n = unsafe { libc::sendfile(socket_fd, file_fd, &mut offset, remaining) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                monoio::time::sleep(std::time::Duration::from_micros(1)).await;
+                stall_count += 1;
+                let delay_us = (1u64 << stall_count.min(10)).min(1000);
+                monoio::time::sleep(std::time::Duration::from_micros(delay_us)).await;
                 continue;
             }
             return Err(err);
@@ -220,6 +236,7 @@ pub async fn send_file_range_contents(
         if n == 0 {
             break;
         }
+        stall_count = 0;
         remaining -= n as usize;
         transferred += n as u64;
     }

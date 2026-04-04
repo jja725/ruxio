@@ -241,6 +241,10 @@ fn main() -> Result<()> {
         inflight_timeout_secs: settings.cluster.inflight_timeout_secs,
         max_connections_per_thread: settings.server.max_connections_per_thread,
         max_prefetch_tasks: settings.cluster.max_prefetch_tasks,
+        write_timeout_secs: settings.server.write_timeout_secs,
+        max_pending_requests: settings.server.max_pending_requests,
+        response_chunk_bytes: settings.server.response_chunk_bytes,
+        sendfile_timeout_secs: settings.server.sendfile_timeout_secs,
     };
 
     let retry_policy = RetryPolicy {
@@ -365,6 +369,7 @@ fn main() -> Result<()> {
                         config: server_config,
                         active_connections: Rc::new(AtomicU32::new(0)),
                         prefetch_outstanding: Rc::new(AtomicU32::new(0)),
+                        pending_requests: Rc::new(AtomicU32::new(0)),
                     });
 
                     // Spawn SPSC inbox processor

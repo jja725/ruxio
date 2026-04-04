@@ -36,7 +36,7 @@ use ruxio_storage::zero_copy;
 
 // ── Server configuration ────────────────────────────────────────────
 
-/// Runtime-configurable server settings (passed from CLI args).
+/// Runtime-configurable server settings (passed from config file).
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Idle timeout per connection (default 300s).
@@ -51,6 +51,14 @@ pub struct ServerConfig {
     pub max_connections_per_thread: u32,
     /// Max outstanding prefetch tasks per thread (default 16).
     pub max_prefetch_tasks: u32,
+    /// Per-write timeout in seconds (default 60s).
+    pub write_timeout_secs: u64,
+    /// Max pending requests per thread before returning RESOURCE_EXHAUSTED (default 1000).
+    pub max_pending_requests: u32,
+    /// Response chunk size for large reads (default 4MB).
+    pub response_chunk_bytes: u64,
+    /// Sendfile deadline in seconds (default 300s).
+    pub sendfile_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -62,6 +70,10 @@ impl Default for ServerConfig {
             inflight_timeout_secs: 30,
             max_connections_per_thread: 10_000,
             max_prefetch_tasks: 16,
+            write_timeout_secs: 60,
+            max_pending_requests: 1_000,
+            response_chunk_bytes: 4 * 1024 * 1024,
+            sendfile_timeout_secs: 300,
         }
     }
 }
@@ -100,6 +112,9 @@ pub struct ThreadContext {
 
     /// Outstanding prefetch task count for this thread.
     pub prefetch_outstanding: Rc<AtomicU32>,
+
+    /// Active in-flight request count for overload rejection.
+    pub pending_requests: Rc<AtomicU32>,
 }
 
 impl ThreadContext {
@@ -141,6 +156,34 @@ impl Drop for PrefetchGuard {
     }
 }
 
+/// RAII guard to decrement pending request counter on drop.
+struct RequestGuard {
+    counter: Rc<AtomicU32>,
+}
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Write a frame to the stream with a timeout. Returns bytes written or error.
+async fn write_frame_with_timeout(
+    stream: &mut TcpStream,
+    frame: Frame,
+    timeout: Duration,
+) -> std::io::Result<u64> {
+    let encoded = frame.encode();
+    let len = encoded.len() as u64;
+    match monoio::time::timeout(timeout, stream.write_all(encoded.to_vec())).await {
+        Ok((Ok(_), _)) => Ok(len),
+        Ok((Err(e), _)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "write timeout",
+        )),
+    }
+}
+
 pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     // Connection limit check
     let current = ctx.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -164,10 +207,11 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     let mut reader = FrameReader::new();
     let mut buf = vec![0u8; 128 * 1024];
     let idle_timeout = Duration::from_secs(ctx.config.idle_timeout_secs);
+    let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
     let max_inflight = ctx.config.max_inflight_bytes;
+    let mut conn_bytes_pending: u64 = 0;
 
     loop {
-        // Check shutdown between iterations
         if ctx.shutdown.load(Ordering::Relaxed) {
             tracing::debug!("Shutdown: closing connection");
             return;
@@ -197,25 +241,25 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
             match reader.next_frame() {
                 Ok(Some(frame)) => {
                     let response_frames = process_frame(frame, &ctx, &mut stream).await;
-                    let mut bytes_pending: u64 = 0;
                     for resp in response_frames {
-                        let encoded = resp.encode();
-                        let frame_len = encoded.len() as u64;
-
-                        // Flow control: wait if too many bytes in flight
-                        while bytes_pending >= max_inflight {
+                        // Backpressure: yield if too many bytes pending.
+                        // write_all returns when kernel accepts bytes into send buffer,
+                        // so we can reset after each yield.
+                        if conn_bytes_pending >= max_inflight {
                             monoio::time::sleep(Duration::from_millis(1)).await;
-                            bytes_pending = 0;
+                            conn_bytes_pending = 0;
                         }
 
-                        let (result, _) = stream.write_all(encoded.to_vec()).await;
-                        if result.is_err() {
-                            return;
+                        match write_frame_with_timeout(&mut stream, resp, write_timeout).await {
+                            Ok(n) => conn_bytes_pending += n,
+                            Err(e) => {
+                                tracing::debug!("Write error: {e}");
+                                return;
+                            }
                         }
-                        bytes_pending += frame_len;
                     }
                 }
-                Ok(None) => break, // Need more data
+                Ok(None) => break,
                 Err(e) => {
                     warn!("Frame decode error: {e}");
                     return;
@@ -537,6 +581,8 @@ async fn scan_streaming(
 ) -> Result<()> {
     let uri = &req.uri;
     let metadata = get_metadata(ctx, uri).await?;
+    let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
+    let chunk_size = ctx.config.response_chunk_bytes as usize;
 
     let row_group_ranges = if let Some(pred) = &req.predicate {
         MetadataCache::find_matching_row_groups(&metadata, pred)
@@ -574,16 +620,34 @@ async fn scan_streaming(
         };
         let data = read_range(ctx, &range_req).await?;
 
-        let chunk = Frame::new_raw(MessageType::DataChunk, request_id, data);
-        let (result, _) = stream.write_all(chunk.encode().to_vec()).await;
-        if result.is_err() {
-            return Ok(());
+        // Chunk large responses to enable backpressure between chunks
+        if data.len() <= chunk_size {
+            let chunk = Frame::new_raw(MessageType::DataChunk, request_id, data);
+            if write_frame_with_timeout(stream, chunk, write_timeout)
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        } else {
+            let mut offset = 0;
+            while offset < data.len() {
+                let end = (offset + chunk_size).min(data.len());
+                let slice = data.slice(offset..end);
+                let chunk = Frame::new_raw(MessageType::DataChunk, request_id, slice);
+                if write_frame_with_timeout(stream, chunk, write_timeout)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                offset = end;
+            }
         }
     }
 
     let done = Frame::done(request_id);
-    let (result, _) = stream.write_all(done.encode().to_vec()).await;
-    if let Err(e) = result {
+    if let Err(e) = write_frame_with_timeout(stream, done, write_timeout).await {
         tracing::debug!("Failed to write Done frame: {e}");
     }
     Ok(())
@@ -601,6 +665,22 @@ async fn process_frame(
     let _active_guard = ActiveOpGuard;
     let _timer = RESPONSE_TIME_COLLECTOR.start_timer();
     let request_id = frame.request_id;
+
+    // Overload rejection: if too many requests pending, reject early
+    let pending = ctx.pending_requests.fetch_add(1, Ordering::Relaxed);
+    let _req_guard = RequestGuard {
+        counter: ctx.pending_requests.clone(),
+    };
+    if pending >= ctx.config.max_pending_requests {
+        return vec![Frame::new_json(
+            MessageType::Error,
+            request_id,
+            &ErrorResponse {
+                code: 503,
+                message: "Server overloaded, try again later".to_string(),
+            },
+        )];
+    }
 
     match frame.msg_type {
         MessageType::ReadRange => handle_read_range(ctx, stream, request_id, &frame.payload).await,
