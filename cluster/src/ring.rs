@@ -123,9 +123,7 @@ impl HashRing {
 }
 
 fn hash_key(key: &str) -> u64 {
-    let mut hasher = Xxh3DefaultBuilder.build_hasher();
-    key.hash(&mut hasher);
-    hasher.finish()
+    Xxh3DefaultBuilder.hash_one(key)
 }
 
 fn hash_vnode(node: &NodeId, vnode_idx: usize) -> u64 {

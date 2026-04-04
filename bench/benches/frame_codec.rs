@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::ReadRangeRequest;

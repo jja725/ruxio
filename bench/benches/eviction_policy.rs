@@ -51,7 +51,7 @@ fn scan_resistant_sequence(hot_size: u64, total_keys: u64, length: usize, seed: 
 
         if r < 0.8 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let idx = (rng >> 33) as u64 % hot_size;
+            let idx = (rng >> 33) % hot_size;
             result.push(idx);
         } else {
             result.push(scan_pos);

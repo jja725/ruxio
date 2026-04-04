@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
 /// Comparison operators for predicate expressions.
@@ -97,9 +97,8 @@ impl PredicateExpr {
     /// Compute a stable hash of this predicate for use as part of a cache key.
     pub fn cache_key_hash(&self) -> u64 {
         let serialized = serde_json::to_string(self).unwrap_or_default();
-        let mut hasher = Xxh3DefaultBuilder.build_hasher();
-        serialized.hash(&mut hasher);
-        hasher.finish()
+
+        Xxh3DefaultBuilder.hash_one(&serialized)
     }
 }
 

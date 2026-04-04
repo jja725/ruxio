@@ -3,7 +3,7 @@ mod data;
 mod http;
 
 use std::cell::RefCell;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -44,9 +44,7 @@ const BENCH_NUM_PAGES: u64 = 100;
 
 /// Determine which thread owns a file URI.
 fn owning_thread(uri: &str, num_threads: usize) -> usize {
-    let mut hasher = Xxh3DefaultBuilder.build_hasher();
-    uri.hash(&mut hasher);
-    (hasher.finish() as usize) % num_threads
+    (Xxh3DefaultBuilder.hash_one(uri) as usize) % num_threads
 }
 
 /// Populate cache only with pages that this thread owns.
@@ -290,7 +288,6 @@ fn main() -> Result<()> {
     // Build server config from settings
     let server_config = data::ServerConfig {
         idle_timeout_secs: settings.server.idle_timeout_secs,
-        max_inflight_bytes: settings.server.max_inflight_bytes,
         prefetch_pages: settings.cluster.prefetch_pages,
         inflight_timeout_secs: settings.cluster.inflight_timeout_secs,
         max_connections_per_thread: settings.server.max_connections_per_thread,
@@ -298,7 +295,6 @@ fn main() -> Result<()> {
         write_timeout_secs: settings.server.write_timeout_secs,
         max_pending_requests: settings.server.max_pending_requests,
         response_chunk_bytes: settings.server.response_chunk_bytes,
-        sendfile_timeout_secs: settings.server.sendfile_timeout_secs,
         write_buffer_high: settings.server.write_buffer_high,
         write_buffer_low: settings.server.write_buffer_low,
     };
@@ -422,7 +418,7 @@ fn main() -> Result<()> {
                         access_tracker: Rc::new(RefCell::new(std::collections::HashMap::new())),
                         retry_policy,
                         shutdown: shutdown.clone(),
-                        ready: ready.clone(),
+                        _ready: ready.clone(),
                         config: server_config,
                         active_connections: Rc::new(AtomicU32::new(0)),
                         prefetch_outstanding: Rc::new(AtomicU32::new(0)),

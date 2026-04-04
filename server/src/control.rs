@@ -13,14 +13,12 @@ fn get_memory_usage_kb() -> (u64, u64) {
     for line in status.lines() {
         if let Some(val) = line.strip_prefix("VmRSS:") {
             rss_kb = val
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
         } else if let Some(val) = line.strip_prefix("VmSize:") {
             vm_kb = val
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())
@@ -31,6 +29,7 @@ fn get_memory_usage_kb() -> (u64, u64) {
 }
 
 /// Get available disk space in bytes for a given path.
+#[allow(dead_code)]
 fn get_disk_free_bytes(path: &str) -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -180,6 +179,7 @@ pub fn start_health_server(addr: String, ready: Arc<AtomicBool>, shutdown: Arc<A
 }
 
 /// Check available disk space and return true if above threshold.
+#[allow(dead_code)]
 pub fn check_disk_space(cache_dir: &str, min_free_bytes: u64) -> bool {
     get_disk_free_bytes(cache_dir) >= min_free_bytes
 }

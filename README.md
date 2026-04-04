@@ -1,6 +1,6 @@
 # Ruxio: Distributed Parquet Cache
 
-A high-performance distributed cache for Parquet files on cloud storage (GCS), built on io_uring via monoio. Inspired by Alluxio's Dora architecture.
+A high-performance distributed cache for Parquet files on cloud storage (GCS), built on io_uring via monoio.
 
 ## Key Features
 
@@ -301,7 +301,7 @@ Uses `sendfile(2)` to transfer cached page data directly from the OS page cache 
 
 ## Production Readiness
 
-Ruxio includes the following production hardening features, modeled after Alluxio's battle-tested Dora architecture:
+Ruxio includes the following production hardening features:
 
 - **GCS retry with exponential backoff** — transient errors (429, 5xx) retried automatically with configurable policy
 - **HTTP/1.1 connection pooling** — TLS connections reused across requests, idle timeout cleanup

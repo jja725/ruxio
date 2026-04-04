@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ruxio_common::metrics::{
-    BYTES_EVICTED, CACHE_DELETE_ERRORS, CACHE_PUT_ERRORS, PAGES_EVICTED, PAGE_CACHE_BYTES,
-    PAGE_CACHE_CAPACITY_BYTES, PAGE_CACHE_PAGES,
+    BYTES_EVICTED, CACHE_DELETE_ERRORS, PAGES_EVICTED, PAGE_CACHE_BYTES, PAGE_CACHE_CAPACITY_BYTES,
+    PAGE_CACHE_PAGES,
 };
 
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
@@ -205,6 +205,7 @@ impl ClockProState {
         None
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -308,6 +309,7 @@ impl LruState {
         self.head == NONE
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.pos.len()
     }
@@ -410,7 +412,7 @@ impl EvictionState {
 
 /// Page cache with configurable eviction (CLOCK-Pro or LRU) and TinyLFU admission.
 ///
-/// Disk layout (Alluxio-style):
+/// Disk layout:
 /// ```text
 /// {root}/{page_size}/{bucket}/{url_safe_file_id}/{page_index}
 /// ```
@@ -551,8 +553,8 @@ impl Cache for PageCache {
     }
 
     fn put(&mut self, key: PageKey, value: CachedPage) -> bool {
-        if self.pages.contains_key(&key) {
-            self.pages.insert(key, value);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.pages.entry(key.clone()) {
+            e.insert(value);
             return true;
         }
 
@@ -738,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn test_page_path_alluxio_layout() {
+    fn test_page_path_layout() {
         let cache = PageCache::new("/tmp/cache", 1024 * 1024, TEST_PAGE_SIZE);
         let key = PageKey::new("test://file.parquet", 3);
         let path = cache.page_path(&key);

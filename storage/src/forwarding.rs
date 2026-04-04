@@ -40,6 +40,12 @@ pub struct SpscRing<T> {
 unsafe impl<T: Send> Send for SpscRing<T> {}
 unsafe impl<T: Send> Sync for SpscRing<T> {}
 
+impl<T> Default for SpscRing<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> SpscRing<T> {
     pub fn new() -> Self {
         let buffer = {
@@ -126,6 +132,12 @@ pub struct ThreadChannel {
     pub replies: SpscRing<ForwardResponse>,
 }
 
+impl Default for ThreadChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThreadChannel {
     pub fn new() -> Self {
         Self {
@@ -202,23 +214,21 @@ pub async fn forward_lookup(
 pub fn process_forwarded_requests(
     channel_matrix: &ChannelMatrix,
     my_thread: usize,
-    num_threads: usize,
+    _num_threads: usize,
     page_cache: &mut PageCache,
 ) {
-    for peer in 0..num_threads {
+    for (peer, row) in channel_matrix.iter().enumerate() {
         if peer == my_thread {
             continue;
         }
 
         // Read requests that peer sent to us
-        let channel = &channel_matrix[peer][my_thread];
+        let channel = &row[my_thread];
 
         while let Some(req) = channel.requests.try_pop() {
-            let result = if let Some(page) = page_cache.get(&req.key) {
-                Some((page.local_path.clone(), page.size))
-            } else {
-                None
-            };
+            let result = page_cache
+                .get(&req.key)
+                .map(|page| (page.local_path.clone(), page.size));
 
             // Send reply back
             let resp = ForwardResponse { path: result };

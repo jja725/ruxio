@@ -49,7 +49,7 @@ enum EtcdCommand {
 /// Communication between monoio workers and the tokio thread uses `std::sync::mpsc`.
 pub struct EtcdMembership {
     self_id: NodeId,
-    config: EtcdConfig,
+    _config: EtcdConfig,
     cmd_tx: mpsc::Sender<EtcdCommand>,
     /// Senders for broadcasting membership events to subscribers.
     subscribers: Arc<Mutex<Vec<mpsc::Sender<MembershipEvent>>>>,
@@ -75,7 +75,7 @@ impl EtcdMembership {
 
         Self {
             self_id,
-            config,
+            _config: config,
             cmd_tx,
             subscribers,
             _bg_handle: bg_handle,

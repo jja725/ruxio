@@ -196,11 +196,9 @@ impl CacheManager {
     /// Get the on-disk file path and size for a cached page (for zero-copy serving).
     pub fn get_page_file(&mut self, file_id: &str, page_index: u64) -> Option<(PathBuf, u64)> {
         let key = PageKey::new(file_id, page_index);
-        if let Some(page) = self.page_cache.get(&key) {
-            Some((page.local_path.clone(), page.size))
-        } else {
-            None
-        }
+        self.page_cache
+            .get(&key)
+            .map(|page| (page.local_path.clone(), page.size))
     }
 
     /// Cache a page: write to disk and insert into page cache.

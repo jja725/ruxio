@@ -14,7 +14,7 @@ fn hex_val(b: u8) -> u8 {
 
 /// Key for page cache lookups.
 ///
-/// Identifies a specific page within a remote file using Alluxio-style
+/// Identifies a specific page within a remote file using
 /// `(file_id, page_index)` addressing. The page_index is computed as
 /// `offset / page_size` by the caller.
 ///
@@ -82,12 +82,10 @@ impl PageKey {
 
     /// Hash bucket for the file_id (0..999) to distribute across directories.
     pub fn file_bucket(file_id: &str) -> u64 {
-        let mut hasher = Xxh3DefaultBuilder.build_hasher();
-        file_id.hash(&mut hasher);
-        hasher.finish() % 1000
+        Xxh3DefaultBuilder.hash_one(file_id) % 1000
     }
 
-    /// Returns the Alluxio-style path component: `{bucket}/{url_safe_file_id}/{page_index}`
+    /// Returns the path component: `{bucket}/{url_safe_file_id}/{page_index}`
     ///
     /// The caller prepends `{root}/{page_size}/` to form the full path.
     pub fn to_path_component(&self) -> String {

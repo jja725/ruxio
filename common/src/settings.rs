@@ -93,7 +93,7 @@ pub struct ServerSettings {
     pub tcp_fastopen_qlen: u32,
     /// Write buffer high water mark (bytes). When pending bytes exceed this,
     /// the connection enters backpressured state and pauses accepting new frames.
-    /// Inspired by Netty's WriteBufferWaterMark. Default 64KB.
+    /// Default 64KB.
     pub write_buffer_high: u64,
     /// Write buffer low water mark (bytes). When pending bytes drain below this,
     /// the connection exits backpressured state and resumes. Default 32KB.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
@@ -114,7 +114,7 @@ impl GcsClient {
         // Read response into BytesMut — single allocation, no intermediate copies
         let (status, body) = read_http_response(&mut stream, expected_len).await?;
 
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             // Don't return connection to pool on error
             let body_str = String::from_utf8_lossy(&body);
             anyhow::bail!("GCS returned HTTP {status}: {body_str}");
@@ -149,7 +149,7 @@ impl GcsClient {
 
         let (status, body) = read_http_response(&mut stream, 0).await?;
 
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
             anyhow::bail!("GCS metadata returned HTTP {status}: {body_str}");
         }
@@ -193,7 +193,7 @@ impl GcsClient {
 
         let (status, body) = read_http_response(&mut stream, 0).await?;
 
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
             anyhow::bail!("GCS list returned HTTP {status}: {body_str}");
         }

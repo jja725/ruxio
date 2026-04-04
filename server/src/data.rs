@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -41,8 +41,6 @@ use ruxio_storage::zero_copy;
 pub struct ServerConfig {
     /// Idle timeout per connection (default 300s).
     pub idle_timeout_secs: u64,
-    /// Max bytes in flight per connection before pausing sends (default 64MB).
-    pub max_inflight_bytes: u64,
     /// Sequential prefetch depth in pages (default 4).
     pub prefetch_pages: u64,
     /// Thundering herd wait timeout (default 30s).
@@ -57,8 +55,6 @@ pub struct ServerConfig {
     pub max_pending_requests: u32,
     /// Response chunk size for large reads (default 4MB).
     pub response_chunk_bytes: u64,
-    /// Sendfile deadline in seconds (default 300s).
-    pub sendfile_timeout_secs: u64,
     /// Write buffer high water mark (bytes). Connection enters backpressured
     /// state when pending bytes exceed this. Default 64KB.
     pub write_buffer_high: u64,
@@ -72,7 +68,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 300,
-            max_inflight_bytes: 64 * 1024 * 1024,
             prefetch_pages: 4,
             inflight_timeout_secs: 30,
             max_connections_per_thread: 10_000,
@@ -80,7 +75,6 @@ impl Default for ServerConfig {
             write_timeout_secs: 60,
             max_pending_requests: 1_000,
             response_chunk_bytes: 4 * 1024 * 1024,
-            sendfile_timeout_secs: 300,
             write_buffer_high: 64 * 1024,
             write_buffer_low: 32 * 1024,
         }
@@ -111,7 +105,7 @@ pub struct ThreadContext {
     pub shutdown: Arc<AtomicBool>,
 
     /// Server readiness flag — false during startup/shutdown.
-    pub ready: Arc<AtomicBool>,
+    pub _ready: Arc<AtomicBool>,
 
     /// Server configuration.
     pub config: ServerConfig,
@@ -128,13 +122,84 @@ pub struct ThreadContext {
 
 impl ThreadContext {
     fn owning_thread(&self, uri: &str) -> usize {
-        let mut hasher = Xxh3DefaultBuilder.build_hasher();
-        uri.hash(&mut hasher);
-        (hasher.finish() as usize) % self.num_threads
+        (Xxh3DefaultBuilder.hash_one(uri) as usize) % self.num_threads
     }
 }
 
 // ── Connection handling ──────────────────────────────────────────────
+
+// ── Request state machine ───────────────────────────────────────────
+//
+// Tracks request lifecycle to prevent silent failures.
+//
+// Key invariant: if a request enters STREAMING state (partial data
+// sent to client), any subsequent error MUST send an Error frame
+// before the request can complete. This prevents:
+// - Partial sendfile leaving client with truncated data
+// - Scan streaming failure with no error indication
+// - BatchRead write failure leaving client hanging
+
+/// Request processing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestState {
+    /// Request received, no data sent yet. Can respond with any frame.
+    Idle,
+    /// Partial data has been written directly to the stream (sendfile,
+    /// streaming scan, batch read). If an error occurs, we MUST send
+    /// an Error frame to the client — they already have partial data.
+    Streaming,
+    /// Request completed successfully (Done frame sent or will be sent).
+    Completed,
+    /// Error occurred. Error frame sent or will be sent.
+    Errored,
+}
+
+/// Tracks a single request's lifecycle.
+struct RequestTracker {
+    state: RequestState,
+    request_id: u32,
+}
+
+impl RequestTracker {
+    fn new(request_id: u32) -> Self {
+        Self {
+            state: RequestState::Idle,
+            request_id,
+        }
+    }
+
+    /// Mark that we've started writing partial data to the stream.
+    fn enter_streaming(&mut self) {
+        if self.state == RequestState::Idle {
+            self.state = RequestState::Streaming;
+        }
+    }
+
+    /// Mark request as completed successfully.
+    fn complete(&mut self) {
+        self.state = RequestState::Completed;
+    }
+
+    /// Mark request as errored.
+    fn error(&mut self) {
+        self.state = RequestState::Errored;
+    }
+
+    /// Check if we've started streaming (partial data sent).
+    /// If true and an error occurs, we must send an error frame.
+    fn is_streaming(&self) -> bool {
+        self.state == RequestState::Streaming
+    }
+
+    /// Build an error frame for this request.
+    fn error_frame(&self, code: u32, message: String) -> Frame {
+        Frame::new_json(
+            MessageType::Error,
+            self.request_id,
+            &ErrorResponse { code, message },
+        )
+    }
+}
 
 /// RAII guard to decrement connected clients gauge on drop.
 struct ConnectionGuard {
@@ -256,7 +321,7 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
                 Ok(Some(frame)) => {
                     let response_frames = process_frame(frame, &ctx, &mut stream).await;
                     for resp in response_frames {
-                        // Watermark-based backpressure (Netty-style hysteresis):
+                        // Watermark-based backpressure (hysteresis):
                         // - Enter backpressured state when pending > high_water
                         // - Stay backpressured until pending drains below low_water
                         // - Prevents flapping between yield/resume on boundary
@@ -335,7 +400,7 @@ fn maybe_prefetch(ctx: &Rc<ThreadContext>, file_id: &Arc<str>, current_page: u64
         let mut tracker = ctx.access_tracker.borrow_mut();
         let last = tracker.get(&**file_id).copied();
         tracker.insert(file_id.clone(), current_page);
-        last.map_or(false, |last| current_page == last + 1)
+        last.is_some_and(|last| current_page == last + 1)
     };
 
     if !is_sequential {
@@ -608,6 +673,7 @@ async fn scan_streaming(
     let metadata = get_metadata(ctx, uri).await?;
     let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
     let chunk_size = ctx.config.response_chunk_bytes as usize;
+    let mut tracker = RequestTracker::new(request_id);
 
     let row_group_ranges = if let Some(pred) = &req.predicate {
         MetadataCache::find_matching_row_groups(&metadata, pred)
@@ -643,7 +709,20 @@ async fn scan_streaming(
             offset: rg_range.offset,
             length: rg_range.length,
         };
-        let data = read_range(ctx, &range_req).await?;
+        let data = match read_range(ctx, &range_req).await {
+            Ok(d) => d,
+            Err(e) => {
+                // Read failed — if we've already sent partial data, send error frame
+                if tracker.is_streaming() {
+                    let err_frame = tracker.error_frame(500, format!("Scan read failed: {e}"));
+                    let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
+                }
+                tracker.error();
+                return Err(e);
+            }
+        };
+
+        tracker.enter_streaming();
 
         // Chunk large responses to enable backpressure between chunks
         if data.len() <= chunk_size {
@@ -652,6 +731,10 @@ async fn scan_streaming(
                 .await
                 .is_err()
             {
+                // Write failed mid-stream — send error frame to client
+                let err_frame = tracker.error_frame(500, "Write failed during scan".to_string());
+                let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
+                tracker.error();
                 return Ok(());
             }
         } else {
@@ -664,6 +747,10 @@ async fn scan_streaming(
                     .await
                     .is_err()
                 {
+                    let err_frame =
+                        tracker.error_frame(500, "Write failed during scan".to_string());
+                    let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
+                    tracker.error();
                     return Ok(());
                 }
                 offset = end;
@@ -675,6 +762,7 @@ async fn scan_streaming(
     if let Err(e) = write_frame_with_timeout(stream, done, write_timeout).await {
         tracing::debug!("Failed to write Done frame: {e}");
     }
+    tracker.complete();
     Ok(())
 }
 
@@ -725,18 +813,29 @@ async fn process_frame(
                 }
             };
 
+            let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
+            let mut tracker = RequestTracker::new(request_id);
+
             // Process all ranges, streaming each result immediately
             for read in &req.reads {
                 let result = read_range(ctx, read).await;
                 match result {
                     Ok(data) => {
+                        tracker.enter_streaming();
                         let chunk = Frame::new_raw(MessageType::DataChunk, request_id, data);
-                        let (r, _) = stream.write_all(chunk.encode().to_vec()).await;
-                        if r.is_err() {
-                            return vec![];
+                        if write_frame_with_timeout(stream, chunk, write_timeout)
+                            .await
+                            .is_err()
+                        {
+                            // Write failed mid-stream — send error so client
+                            // knows the batch is incomplete
+                            tracker.error();
+                            return vec![tracker
+                                .error_frame(500, "Write failed during batch read".to_string())];
                         }
                     }
                     Err(e) => {
+                        tracker.error();
                         return vec![Frame::new_json(
                             MessageType::Error,
                             request_id,
@@ -748,6 +847,7 @@ async fn process_frame(
                     }
                 }
             }
+            tracker.complete();
             vec![Frame::done(request_id)]
         }
 
@@ -924,13 +1024,27 @@ async fn handle_read_range(
                 })
                 .collect();
 
-            if zero_copy::send_file_slices_to_socket(&file_slices, request_id, stream)
-                .await
-                .is_ok()
-            {
-                let file_id: Arc<str> = Arc::from(req.uri.as_str());
-                maybe_prefetch(ctx, &file_id, last_page);
-                return vec![];
+            match zero_copy::send_file_slices_to_socket(&file_slices, request_id, stream).await {
+                Ok(_) => {
+                    let file_id: Arc<str> = Arc::from(req.uri.as_str());
+                    maybe_prefetch(ctx, &file_id, last_page);
+                    return vec![];
+                }
+                Err(e) => {
+                    // Sendfile failed — partial DataChunk header may have been
+                    // written. Send an Error frame so the client knows the
+                    // stream is corrupt. This is the key bug the state machine
+                    // prevents: without this, the client sees truncated data.
+                    warn!("Sendfile failed for {}: {e}", req.uri);
+                    return vec![Frame::new_json(
+                        MessageType::Error,
+                        request_id,
+                        &ErrorResponse {
+                            code: 500,
+                            message: format!("Sendfile failed: {e}"),
+                        },
+                    )];
+                }
             }
         }
 
@@ -957,11 +1071,19 @@ async fn handle_read_range(
         if let Some((file_path, file_size)) =
             forwarding::forward_lookup(&ctx.channels, ctx.thread_id, owner_thread, key).await
         {
-            if zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream)
-                .await
-                .is_ok()
-            {
-                return vec![];
+            match zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream).await {
+                Ok(_) => return vec![],
+                Err(e) => {
+                    warn!("Forwarded sendfile failed for {}: {e}", req.uri);
+                    return vec![Frame::new_json(
+                        MessageType::Error,
+                        request_id,
+                        &ErrorResponse {
+                            code: 500,
+                            message: format!("Sendfile failed: {e}"),
+                        },
+                    )];
+                }
             }
         }
 

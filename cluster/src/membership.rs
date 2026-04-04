@@ -14,7 +14,7 @@ use crate::service::{MembershipEvent, MembershipService};
 pub struct ClusterMembership {
     service: Box<dyn MembershipService>,
     ring: RefCell<HashRing>,
-    vnodes: usize,
+    _vnodes: usize,
     event_rx: mpsc::Receiver<MembershipEvent>,
 }
 
@@ -27,7 +27,7 @@ impl ClusterMembership {
         Self {
             service,
             ring: RefCell::new(ring),
-            vnodes,
+            _vnodes: vnodes,
             event_rx,
         }
     }

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
@@ -166,7 +165,7 @@ async fn serve_connection(
 
 fn start_client_thread(
     port: u16,
-    num_requests: u64,
+    _num_requests: u64,
     total_bytes: Arc<AtomicU64>,
     total_ops: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
@@ -314,7 +313,7 @@ fn main() {
     let running = Arc::new(AtomicBool::new(false));
 
     println!("Starting {num_client_conns} client connections...");
-    let mut client_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let _client_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for i in 0..num_client_conns {
         let port = BASE_PORT + (i % num_server_threads) as u16;
         let tb = total_bytes.clone();
