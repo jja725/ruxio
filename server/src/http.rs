@@ -165,13 +165,15 @@ pub async fn serve_http_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     let _ = stream.set_nodelay(true);
     let mut buf = vec![0u8; 8192];
     let mut filled = 0usize;
+    let header_timeout = std::time::Duration::from_secs(10);
 
     loop {
         // Read until we have a complete header block (\r\n\r\n)
+        // with timeout to prevent slowloris attacks
         let header_end;
+        let deadline = std::time::Instant::now() + header_timeout;
         loop {
             if filled >= buf.len() {
-                // Header too large
                 let _ = write_error(
                     &mut stream,
                     431,
@@ -182,14 +184,28 @@ pub async fn serve_http_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
                 .await;
                 return;
             }
+            if std::time::Instant::now() >= deadline {
+                tracing::debug!("HTTP header read timeout");
+                return;
+            }
             let read_buf = buf.split_off(filled);
-            let (result, returned_buf) = stream.read(read_buf).await;
+            let read_result = monoio::time::timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                stream.read(read_buf),
+            )
+            .await;
+            let (result, returned_buf) = match read_result {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::debug!("HTTP header read timeout");
+                    return;
+                }
+            };
             let n = match result {
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(_) => return,
             };
-            // Reassemble buffer
             buf.extend_from_slice(&returned_buf[..n]);
             filled += n;
 

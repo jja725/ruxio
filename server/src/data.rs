@@ -18,7 +18,7 @@ use ruxio_common::metrics::{
     ACTIVE_OPERATIONS, BYTES_READ_CACHE, BYTES_READ_GCS, BYTES_SERVED_TOTAL, CACHE_GET_ERRORS,
     CACHE_HIT_COUNTER, CACHE_MISS_COUNTER, CACHE_READ_LATENCY, CONNECTED_CLIENTS,
     GCS_FETCH_COUNTER, GCS_FETCH_LATENCY, INCOMING_REQUESTS, INFLIGHT_COALESCED,
-    METADATA_CACHE_HITS, METADATA_CACHE_MISSES, PREFETCH_PAGES_TOTAL, RESPONSE_TIME_COLLECTOR,
+    METADATA_CACHE_HITS, METADATA_CACHE_MISSES, RESPONSE_TIME_COLLECTOR,
 };
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::{
@@ -41,42 +41,36 @@ use ruxio_storage::zero_copy;
 pub struct ServerConfig {
     /// Idle timeout per connection (default 300s).
     pub idle_timeout_secs: u64,
-    /// Sequential prefetch depth in pages (default 4).
-    pub prefetch_pages: u64,
     /// Thundering herd wait timeout (default 30s).
     pub inflight_timeout_secs: u64,
     /// Max concurrent connections per worker thread (default 10000).
     pub max_connections_per_thread: u32,
-    /// Max outstanding prefetch tasks per thread (default 16).
-    pub max_prefetch_tasks: u32,
     /// Per-write timeout in seconds (default 60s).
     pub write_timeout_secs: u64,
     /// Max pending requests per thread before returning RESOURCE_EXHAUSTED (default 1000).
     pub max_pending_requests: u32,
     /// Response chunk size for large reads (default 4MB).
     pub response_chunk_bytes: u64,
-    /// Write buffer high water mark (bytes). Connection enters backpressured
-    /// state when pending bytes exceed this. Default 64KB.
+    /// Write buffer high water mark (bytes). Default 64KB.
     pub write_buffer_high: u64,
-    /// Write buffer low water mark (bytes). Connection exits backpressured
-    /// state when pending bytes drain below this. Default 32KB.
-    /// Hysteresis between high/low prevents flapping.
+    /// Write buffer low water mark (bytes). Default 32KB.
     pub write_buffer_low: u64,
+    /// Forward lookup timeout in seconds (default 5).
+    pub forward_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 300,
-            prefetch_pages: 4,
             inflight_timeout_secs: 30,
             max_connections_per_thread: 10_000,
-            max_prefetch_tasks: 16,
             write_timeout_secs: 60,
             max_pending_requests: 1_000,
             response_chunk_bytes: 4 * 1024 * 1024,
             write_buffer_high: 64 * 1024,
             write_buffer_low: 32 * 1024,
+            forward_timeout_secs: 5,
         }
     }
 }
@@ -95,26 +89,17 @@ pub struct ThreadContext {
     /// In-flight GCS fetches for thundering herd prevention.
     pub inflight: Rc<RefCell<HashSet<PageKey>>>,
 
-    /// Sequential access tracking for prefetching.
-    pub access_tracker: Rc<RefCell<HashMap<Arc<str>, u64>>>,
-
     /// Retry policy for GCS operations.
     pub retry_policy: RetryPolicy,
 
     /// Shutdown flag — set by signal handler.
     pub shutdown: Arc<AtomicBool>,
 
-    /// Server readiness flag — false during startup/shutdown.
-    pub _ready: Arc<AtomicBool>,
-
     /// Server configuration.
     pub config: ServerConfig,
 
     /// Active connection count for this thread.
     pub active_connections: Rc<AtomicU32>,
-
-    /// Outstanding prefetch task count for this thread.
-    pub prefetch_outstanding: Rc<AtomicU32>,
 
     /// Active in-flight request count for overload rejection.
     pub pending_requests: Rc<AtomicU32>,
@@ -126,31 +111,20 @@ impl ThreadContext {
     }
 }
 
-// ── Connection handling ──────────────────────────────────────────────
-
 // ── Request state machine ───────────────────────────────────────────
 //
 // Tracks request lifecycle to prevent silent failures.
 //
 // Key invariant: if a request enters STREAMING state (partial data
 // sent to client), any subsequent error MUST send an Error frame
-// before the request can complete. This prevents:
-// - Partial sendfile leaving client with truncated data
-// - Scan streaming failure with no error indication
-// - BatchRead write failure leaving client hanging
+// before the request can complete.
 
 /// Request processing state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestState {
-    /// Request received, no data sent yet. Can respond with any frame.
     Idle,
-    /// Partial data has been written directly to the stream (sendfile,
-    /// streaming scan, batch read). If an error occurs, we MUST send
-    /// an Error frame to the client — they already have partial data.
     Streaming,
-    /// Request completed successfully (Done frame sent or will be sent).
     Completed,
-    /// Error occurred. Error frame sent or will be sent.
     Errored,
 }
 
@@ -168,30 +142,24 @@ impl RequestTracker {
         }
     }
 
-    /// Mark that we've started writing partial data to the stream.
     fn enter_streaming(&mut self) {
         if self.state == RequestState::Idle {
             self.state = RequestState::Streaming;
         }
     }
 
-    /// Mark request as completed successfully.
     fn complete(&mut self) {
         self.state = RequestState::Completed;
     }
 
-    /// Mark request as errored.
     fn error(&mut self) {
         self.state = RequestState::Errored;
     }
 
-    /// Check if we've started streaming (partial data sent).
-    /// If true and an error occurs, we must send an error frame.
     fn is_streaming(&self) -> bool {
         self.state == RequestState::Streaming
     }
 
-    /// Build an error frame for this request.
     fn error_frame(&self, code: u32, message: String) -> Frame {
         Frame::new_json(
             MessageType::Error,
@@ -200,6 +168,8 @@ impl RequestTracker {
         )
     }
 }
+
+// ── Connection handling ──────────────────────────────────────────────
 
 /// RAII guard to decrement connected clients gauge on drop.
 struct ConnectionGuard {
@@ -217,16 +187,6 @@ struct ActiveOpGuard;
 impl Drop for ActiveOpGuard {
     fn drop(&mut self) {
         ACTIVE_OPERATIONS.dec();
-    }
-}
-
-/// RAII guard to decrement prefetch counter on drop.
-struct PrefetchGuard {
-    counter: Rc<AtomicU32>,
-}
-impl Drop for PrefetchGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -284,9 +244,6 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
     let high_water = ctx.config.write_buffer_high;
     let low_water = ctx.config.write_buffer_low;
-    // Connection-level bytes-in-flight counter for watermark backpressure.
-    // When pending exceeds high_water, we enter backpressured state and
-    // yield until it drains below low_water. Hysteresis prevents flapping.
     let mut conn_bytes_pending: u64 = 0;
     let mut backpressured = false;
 
@@ -322,15 +279,9 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
                     let response_frames = process_frame(frame, &ctx, &mut stream).await;
                     for resp in response_frames {
                         // Watermark-based backpressure (hysteresis):
-                        // - Enter backpressured state when pending > high_water
-                        // - Stay backpressured until pending drains below low_water
-                        // - Prevents flapping between yield/resume on boundary
                         if backpressured {
                             while conn_bytes_pending > low_water {
                                 monoio::time::sleep(Duration::from_millis(1)).await;
-                                // write_all is synchronous from our perspective —
-                                // once it returns, kernel accepted the bytes.
-                                // So reset after yield.
                                 conn_bytes_pending = 0;
                             }
                             backpressured = false;
@@ -362,7 +313,6 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
 // ── Thundering herd ──────────────────────────────────────────────────
 
 /// Wait for an in-flight fetch to complete, with timeout.
-/// Returns true if the fetch completed, false if timed out.
 async fn wait_for_inflight(ctx: &ThreadContext, key: &PageKey) -> bool {
     let timeout = Duration::from_secs(ctx.config.inflight_timeout_secs);
     let deadline = std::time::Instant::now() + timeout;
@@ -371,8 +321,6 @@ async fn wait_for_inflight(ctx: &ThreadContext, key: &PageKey) -> bool {
             return true;
         }
         if std::time::Instant::now() >= deadline {
-            // Timed out — remove the stale inflight entry so it doesn't
-            // block future requests. The page will be re-fetched.
             ctx.inflight.borrow_mut().remove(key);
             return false;
         }
@@ -381,7 +329,6 @@ async fn wait_for_inflight(ctx: &ThreadContext, key: &PageKey) -> bool {
 }
 
 /// RAII guard that removes a PageKey from the inflight set on drop.
-/// Ensures cleanup even if the async task panics.
 struct InflightGuard {
     inflight: Rc<RefCell<HashSet<PageKey>>>,
     key: PageKey,
@@ -390,67 +337,6 @@ struct InflightGuard {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.inflight.borrow_mut().remove(&self.key);
-    }
-}
-
-// ── Sequential prefetching ───────────────────────────────────────────
-
-fn maybe_prefetch(ctx: &Rc<ThreadContext>, file_id: &Arc<str>, current_page: u64) {
-    let is_sequential = {
-        let mut tracker = ctx.access_tracker.borrow_mut();
-        let last = tracker.get(&**file_id).copied();
-        tracker.insert(file_id.clone(), current_page);
-        last.is_some_and(|last| current_page == last + 1)
-    };
-
-    if !is_sequential {
-        return;
-    }
-
-    let page_size = ctx.cache_manager.borrow().page_size();
-
-    for i in 1..=ctx.config.prefetch_pages {
-        // Bound outstanding prefetch tasks
-        let outstanding = ctx.prefetch_outstanding.load(Ordering::Relaxed);
-        if outstanding >= ctx.config.max_prefetch_tasks {
-            break;
-        }
-
-        let prefetch_idx = current_page + i;
-        let key = PageKey::with_arc(file_id.clone(), prefetch_idx);
-
-        let already_cached = ctx.cache_manager.borrow_mut().page_cache.contains(&key);
-        let already_inflight = ctx.inflight.borrow().contains(&key);
-
-        if already_cached || already_inflight {
-            continue;
-        }
-
-        ctx.inflight.borrow_mut().insert(key.clone());
-        ctx.prefetch_outstanding.fetch_add(1, Ordering::Relaxed);
-        PREFETCH_PAGES_TOTAL.inc();
-
-        let ctx = ctx.clone();
-        let file_id = file_id.clone();
-        monoio::spawn(async move {
-            // Guard ensures inflight entry is removed even on panic
-            let _guard = InflightGuard {
-                inflight: ctx.inflight.clone(),
-                key: key.clone(),
-            };
-            let _prefetch_guard = PrefetchGuard {
-                counter: ctx.prefetch_outstanding.clone(),
-            };
-            let page_offset = prefetch_idx * page_size;
-            let fetch_end = page_offset + page_size;
-            if let Ok(data) = ctx
-                .gcs
-                .get_range_with_retry(&file_id, page_offset..fetch_end, &ctx.retry_policy)
-                .await
-            {
-                ctx.cache_manager.borrow_mut().cache_page(&key, &data);
-            }
-        });
     }
 }
 
@@ -468,27 +354,21 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
             BYTES_READ_CACHE.inc_by(data_len);
             BYTES_SERVED_TOTAL.inc_by(data_len);
             let _cache_timer = CACHE_READ_LATENCY.start_timer();
-            let page_size = ctx.cache_manager.borrow().page_size();
-            let file_id: Arc<str> = Arc::from(req.uri.as_str());
-            maybe_prefetch(ctx, &file_id, req.offset / page_size);
             Ok(data)
         }
-        RangeResult::Miss { misses, coalesced } => {
+        RangeResult::Miss { coalesced, .. } => {
             CACHE_MISS_COUNTER.inc();
             let page_size = ctx.cache_manager.borrow().page_size();
             let file_id: Arc<str> = Arc::from(req.uri.as_str());
 
-            // Fetch from GCS using coalesced ranges, keep data in memory
             let mut fetched: HashMap<u64, Bytes> = HashMap::new();
 
             for range in &coalesced {
-                // Thundering herd: wait for pages already being fetched
                 let mut needs_fetch = Vec::new();
                 for key in &range.page_keys {
                     if ctx.inflight.borrow().contains(key) {
                         INFLIGHT_COALESCED.inc();
                         wait_for_inflight(ctx, key).await;
-                        // Now cached — will be read from disk during assembly
                     } else if !ctx.cache_manager.borrow_mut().page_cache.contains(key) {
                         needs_fetch.push(key.clone());
                     }
@@ -498,12 +378,10 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                     continue;
                 }
 
-                // Mark as in-flight
                 for key in &needs_fetch {
                     ctx.inflight.borrow_mut().insert(key.clone());
                 }
 
-                // Single coalesced GCS request
                 GCS_FETCH_COUNTER.inc();
                 let _gcs_timer = GCS_FETCH_LATENCY.start_timer();
                 let data = match ctx
@@ -521,7 +399,6 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                         d
                     }
                     Err(e) => {
-                        // GCS fetch failed — remove all inflight entries
                         for key in &needs_fetch {
                             ctx.inflight.borrow_mut().remove(key);
                         }
@@ -529,7 +406,6 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                     }
                 };
 
-                // Split into pages, keep in memory for immediate return
                 for key in &needs_fetch {
                     let start = (key.page_index * page_size - range.start_offset) as usize;
                     let end = (start + page_size as usize).min(data.len());
@@ -537,7 +413,6 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                         let page_data = data.slice(start..end);
                         fetched.insert(key.page_index, page_data.clone());
 
-                        // Async cache to disk with guard for cleanup
                         let cm = ctx.cache_manager.clone();
                         let inflight = ctx.inflight.clone();
                         let key_owned = key.clone();
@@ -547,7 +422,6 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                                 key: key_owned.clone(),
                             };
                             cm.borrow_mut().cache_page(&key_owned, &page_data);
-                            // _guard dropped → inflight.remove()
                         });
                     } else {
                         ctx.inflight.borrow_mut().remove(key);
@@ -555,18 +429,13 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                 }
             }
 
-            // Trigger prefetch
-            let last_page = misses.last().map(|(k, _)| k.page_index).unwrap_or(0);
-            maybe_prefetch(ctx, &file_id, last_page);
-
-            // Assemble result: cached pages from disk, fetched pages from memory
+            // Assemble result
             let start = req.offset;
             let end = req.offset + req.length;
             let first_page = start / page_size;
             let last_page_idx = (end - 1) / page_size;
 
             if first_page == last_page_idx {
-                // Single page — fast path
                 if let Some(data) = fetched.get(&first_page) {
                     let slice_start = (start - first_page * page_size) as usize;
                     let slice_end = (end - first_page * page_size) as usize;
@@ -577,14 +446,12 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                 }
             }
 
-            // Multi-page assembly
             let mut result = Vec::with_capacity(req.length as usize);
             for page_idx in first_page..=last_page_idx {
                 let page_offset = page_idx * page_size;
                 let page_data = if let Some(data) = fetched.get(&page_idx) {
                     data.clone()
                 } else {
-                    // Read from disk (OS page cache handles memory)
                     let key = PageKey::with_arc(file_id.clone(), page_idx);
                     let path = ctx
                         .cache_manager
@@ -595,7 +462,6 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                     if let Some(path) = path {
                         match std::fs::read(&path) {
                             Ok(data) => {
-                                // Validate page size
                                 if data.len() as u64 > page_size * 2 {
                                     CACHE_GET_ERRORS.inc();
                                     warn!(
@@ -612,7 +478,6 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                             Err(e) => {
                                 CACHE_GET_ERRORS.inc();
                                 warn!("Page read error {}: {e}", path.display());
-                                // Remove corrupted/missing entry from cache
                                 ctx.cache_manager.borrow_mut().page_cache.remove(&key);
                                 continue;
                             }
@@ -712,7 +577,6 @@ async fn scan_streaming(
         let data = match read_range(ctx, &range_req).await {
             Ok(d) => d,
             Err(e) => {
-                // Read failed — if we've already sent partial data, send error frame
                 if tracker.is_streaming() {
                     let err_frame = tracker.error_frame(500, format!("Scan read failed: {e}"));
                     let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
@@ -724,14 +588,12 @@ async fn scan_streaming(
 
         tracker.enter_streaming();
 
-        // Chunk large responses to enable backpressure between chunks
         if data.len() <= chunk_size {
             let chunk = Frame::new_raw(MessageType::DataChunk, request_id, data);
             if write_frame_with_timeout(stream, chunk, write_timeout)
                 .await
                 .is_err()
             {
-                // Write failed mid-stream — send error frame to client
                 let err_frame = tracker.error_frame(500, "Write failed during scan".to_string());
                 let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
                 tracker.error();
@@ -779,7 +641,7 @@ async fn process_frame(
     let _timer = RESPONSE_TIME_COLLECTOR.start_timer();
     let request_id = frame.request_id;
 
-    // Overload rejection: if too many requests pending, reject early
+    // Overload rejection
     let pending = ctx.pending_requests.fetch_add(1, Ordering::Relaxed);
     let _req_guard = RequestGuard {
         counter: ctx.pending_requests.clone(),
@@ -816,10 +678,8 @@ async fn process_frame(
             let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
             let mut tracker = RequestTracker::new(request_id);
 
-            // Process all ranges, streaming each result immediately
             for read in &req.reads {
-                let result = read_range(ctx, read).await;
-                match result {
+                match read_range(ctx, read).await {
                     Ok(data) => {
                         tracker.enter_streaming();
                         let chunk = Frame::new_raw(MessageType::DataChunk, request_id, data);
@@ -827,8 +687,6 @@ async fn process_frame(
                             .await
                             .is_err()
                         {
-                            // Write failed mid-stream — send error so client
-                            // knows the batch is incomplete
                             tracker.error();
                             return vec![tracker
                                 .error_frame(500, "Write failed during batch read".to_string())];
@@ -866,8 +724,7 @@ async fn process_frame(
                 }
             };
 
-            let result = get_metadata(ctx, &req.uri).await;
-            match result {
+            match get_metadata(ctx, &req.uri).await {
                 Ok(meta) => {
                     let meta_resp = MetadataResponse {
                         uri: req.uri,
@@ -919,10 +776,7 @@ async fn process_frame(
             vec![]
         }
 
-        MessageType::Heartbeat => {
-            // Activity already tracked by the read timeout reset.
-            vec![]
-        }
+        MessageType::Heartbeat => vec![],
 
         MessageType::Cancel => {
             tracing::debug!("Cancel received for request_id={}", frame.request_id);
@@ -988,7 +842,6 @@ async fn handle_read_range(
         let first_page = req.offset / page_size;
         let last_page = (req.offset + req.length - 1) / page_size;
 
-        // Collect file paths for all pages in the range
         let mut slices: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
         let mut all_cached = true;
 
@@ -1000,12 +853,9 @@ async fn handle_read_range(
             if let Some((file_path, file_size)) = file_info {
                 let page_start = page_idx * page_size;
                 let page_end = page_start + file_size;
-
-                // Compute the slice of this page that overlaps with the request
                 let slice_start = req.offset.max(page_start) - page_start;
                 let slice_end = (req.offset + req.length).min(page_end) - page_start;
                 let slice_len = slice_end - slice_start;
-
                 slices.push((file_path, slice_start, slice_len));
             } else {
                 all_cached = false;
@@ -1014,7 +864,6 @@ async fn handle_read_range(
         }
 
         if all_cached && !slices.is_empty() {
-            // All pages cached — sendfile each slice, zero userspace copies
             let file_slices: Vec<zero_copy::FileSlice<'_>> = slices
                 .iter()
                 .map(|(path, offset, length)| zero_copy::FileSlice {
@@ -1025,16 +874,8 @@ async fn handle_read_range(
                 .collect();
 
             match zero_copy::send_file_slices_to_socket(&file_slices, request_id, stream).await {
-                Ok(_) => {
-                    let file_id: Arc<str> = Arc::from(req.uri.as_str());
-                    maybe_prefetch(ctx, &file_id, last_page);
-                    return vec![];
-                }
+                Ok(_) => return vec![],
                 Err(e) => {
-                    // Sendfile failed — partial DataChunk header may have been
-                    // written. Send an Error frame so the client knows the
-                    // stream is corrupt. This is the key bug the state machine
-                    // prevents: without this, the client sees truncated data.
                     warn!("Sendfile failed for {}: {e}", req.uri);
                     return vec![Frame::new_json(
                         MessageType::Error,
@@ -1048,9 +889,8 @@ async fn handle_read_range(
             }
         }
 
-        // Buffered fallback with send-then-cache
-        let result = read_range(ctx, &req).await;
-        match result {
+        // Buffered fallback
+        match read_range(ctx, &req).await {
             Ok(data) => vec![
                 Frame::new_raw(MessageType::DataChunk, request_id, data),
                 Frame::done(request_id),
@@ -1065,25 +905,37 @@ async fn handle_read_range(
             )],
         }
     } else {
-        // FORWARDED via SPSC channels
+        // FORWARDED via SPSC channels (with timeout)
         let key = PageKey::new(&req.uri, page_index);
+        let forward_timeout = Duration::from_secs(ctx.config.forward_timeout_secs);
 
-        if let Some((file_path, file_size)) =
-            forwarding::forward_lookup(&ctx.channels, ctx.thread_id, owner_thread, key).await
+        match monoio::time::timeout(
+            forward_timeout,
+            forwarding::forward_lookup(&ctx.channels, ctx.thread_id, owner_thread, key),
+        )
+        .await
         {
-            match zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream).await {
-                Ok(_) => return vec![],
-                Err(e) => {
-                    warn!("Forwarded sendfile failed for {}: {e}", req.uri);
-                    return vec![Frame::new_json(
-                        MessageType::Error,
-                        request_id,
-                        &ErrorResponse {
-                            code: 500,
-                            message: format!("Sendfile failed: {e}"),
-                        },
-                    )];
+            Ok(Some((file_path, file_size))) => {
+                match zero_copy::send_file_to_socket(&file_path, file_size, request_id, stream)
+                    .await
+                {
+                    Ok(_) => return vec![],
+                    Err(e) => {
+                        warn!("Forwarded sendfile failed for {}: {e}", req.uri);
+                        return vec![Frame::new_json(
+                            MessageType::Error,
+                            request_id,
+                            &ErrorResponse {
+                                code: 500,
+                                message: format!("Sendfile failed: {e}"),
+                            },
+                        )];
+                    }
                 }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                warn!("Forward lookup timeout for {}", req.uri);
             }
         }
 

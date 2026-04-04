@@ -122,12 +122,6 @@ lazy_static! {
     pub static ref CLUSTER_MEMBERS: IntGauge =
         register_int_gauge!("cluster_members", "Number of nodes in the cluster").unwrap();
 
-    // ── Prefetch metrics ────────────────────────────────────────────
-
-    /// Pages prefetched.
-    pub static ref PREFETCH_PAGES_TOTAL: Counter =
-        register_counter!("prefetch_pages_total", "Pages prefetched").unwrap();
-
     // ── Thundering herd metrics ─────────────────────────────────────
 
     /// Requests that waited on in-flight fetches (thundering herd coalesced).

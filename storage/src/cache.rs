@@ -202,13 +202,15 @@ impl CacheManager {
     }
 
     /// Cache a page: write to disk and insert into page cache.
+    /// If disk write fails, the page is NOT cached (no phantom entries).
     pub fn cache_page(&mut self, key: &PageKey, data: &[u8]) {
         let size = data.len() as u64;
         let local_path = match self.page_cache.write_page_to_disk(key, data) {
             Ok(p) => p,
-            Err(_) => {
+            Err(e) => {
                 ruxio_common::metrics::CACHE_PUT_ERRORS.inc();
-                self.page_cache.page_path(key)
+                tracing::warn!("Failed to cache page {}: {e}", key.file_id);
+                return; // Don't insert phantom entry
             }
         };
 

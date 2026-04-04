@@ -182,7 +182,6 @@ fn create_listener(
     // TCP_FASTOPEN (Linux only) — allows data in the SYN packet
     #[cfg(target_os = "linux")]
     if settings.tcp_fastopen {
-        // TCP_FASTOPEN is set on the *listening* socket with the queue length
         let optval = settings.tcp_fastopen_qlen as libc::c_int;
         unsafe {
             libc::setsockopt(
@@ -194,6 +193,26 @@ fn create_listener(
             );
         }
     }
+
+    // TCP_USER_TIMEOUT (Linux only) — kernel drops connection if no ACK
+    // for this many ms. More reliable than app-level idle timeout.
+    #[cfg(target_os = "linux")]
+    {
+        let timeout_ms = (settings.idle_timeout_secs * 1000) as libc::c_int;
+        unsafe {
+            libc::setsockopt(
+                std::os::unix::io::AsRawFd::as_raw_fd(&socket),
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &timeout_ms as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    // SO_LINGER — ensure in-flight data is transmitted before close.
+    // Linger for 5 seconds; kernel will attempt to send remaining data.
+    socket.set_linger(Some(std::time::Duration::from_secs(5)))?;
 
     socket.bind(&sock_addr.into())?;
     socket.listen(settings.so_backlog as i32)?;
@@ -288,15 +307,14 @@ fn main() -> Result<()> {
     // Build server config from settings
     let server_config = data::ServerConfig {
         idle_timeout_secs: settings.server.idle_timeout_secs,
-        prefetch_pages: settings.cluster.prefetch_pages,
         inflight_timeout_secs: settings.cluster.inflight_timeout_secs,
         max_connections_per_thread: settings.server.max_connections_per_thread,
-        max_prefetch_tasks: settings.cluster.max_prefetch_tasks,
         write_timeout_secs: settings.server.write_timeout_secs,
         max_pending_requests: settings.server.max_pending_requests,
         response_chunk_bytes: settings.server.response_chunk_bytes,
         write_buffer_high: settings.server.write_buffer_high,
         write_buffer_low: settings.server.write_buffer_low,
+        forward_timeout_secs: 5,
     };
 
     let retry_policy = RetryPolicy {
@@ -344,6 +362,7 @@ fn main() -> Result<()> {
                     Ok(rt) => rt,
                     Err(e) => {
                         tracing::error!("Worker {thread_id}: failed to build runtime: {e}");
+                        shutdown.store(true, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -351,6 +370,7 @@ fn main() -> Result<()> {
                 rt.block_on(async move {
                     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
                         tracing::error!("Worker {thread_id}: failed to create cache dir: {e}");
+                        shutdown.store(true, Ordering::SeqCst);
                         return;
                     }
                     let gcs = GcsClient::new(&bucket)
@@ -415,13 +435,10 @@ fn main() -> Result<()> {
                         num_threads: threads,
                         channels: channels.clone(),
                         inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
-                        access_tracker: Rc::new(RefCell::new(std::collections::HashMap::new())),
                         retry_policy,
                         shutdown: shutdown.clone(),
-                        _ready: ready.clone(),
                         config: server_config,
                         active_connections: Rc::new(AtomicU32::new(0)),
-                        prefetch_outstanding: Rc::new(AtomicU32::new(0)),
                         pending_requests: Rc::new(AtomicU32::new(0)),
                     });
 
@@ -454,6 +471,7 @@ fn main() -> Result<()> {
                             tracing::error!(
                                 "Worker {thread_id}: failed to bind data port {addr}: {e}"
                             );
+                            shutdown.store(true, Ordering::SeqCst);
                             return;
                         }
                     };
@@ -464,6 +482,7 @@ fn main() -> Result<()> {
                             tracing::error!(
                                 "Worker {thread_id}: failed to bind HTTP port {http_addr}: {e}"
                             );
+                            shutdown.store(true, Ordering::SeqCst);
                             return;
                         }
                     };

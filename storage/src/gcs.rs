@@ -120,6 +120,14 @@ impl GcsClient {
             anyhow::bail!("GCS returned HTTP {status}: {body_str}");
         }
 
+        // Validate response body length matches expected range size
+        if body.len() != expected_len {
+            anyhow::bail!(
+                "GCS response body length mismatch: expected {expected_len}, got {}",
+                body.len()
+            );
+        }
+
         // Return connection to pool for reuse
         self.return_connection(stream);
 

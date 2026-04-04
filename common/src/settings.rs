@@ -106,8 +106,6 @@ pub struct ServerSettings {
 pub struct ClusterSettings {
     pub vnodes_per_node: usize,
     pub etcd_lease_ttl_secs: u64,
-    pub prefetch_pages: u64,
-    pub max_prefetch_tasks: u32,
     pub inflight_timeout_secs: u64,
 }
 
@@ -165,8 +163,6 @@ impl Default for ClusterSettings {
         Self {
             vnodes_per_node: 150,
             etcd_lease_ttl_secs: 10,
-            prefetch_pages: 4,
-            max_prefetch_tasks: 16,
             inflight_timeout_secs: 30,
         }
     }
@@ -306,12 +302,6 @@ impl From<Config> for Settings {
             etcd_lease_ttl_secs: config
                 .get::<u64>("cluster.etcd_lease_ttl_secs")
                 .unwrap_or(cluster_defaults.etcd_lease_ttl_secs),
-            prefetch_pages: config
-                .get::<u64>("cluster.prefetch_pages")
-                .unwrap_or(cluster_defaults.prefetch_pages),
-            max_prefetch_tasks: config
-                .get::<u32>("cluster.max_prefetch_tasks")
-                .unwrap_or(cluster_defaults.max_prefetch_tasks),
             inflight_timeout_secs: config
                 .get::<u64>("cluster.inflight_timeout_secs")
                 .unwrap_or(cluster_defaults.inflight_timeout_secs),
