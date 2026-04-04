@@ -19,3 +19,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
+etcd-client = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }

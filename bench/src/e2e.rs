@@ -8,8 +8,9 @@ use bytes::Bytes;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
-use ruxio_cluster::membership::{ClusterMembership, DiscoveryMode};
+use ruxio_cluster::membership::ClusterMembership;
 use ruxio_cluster::ring::NodeId;
+use ruxio_cluster::static_membership::StaticMembership;
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::ReadRangeRequest;
 use ruxio_storage::cache::{CacheManager, RangeResult};
@@ -60,7 +61,7 @@ fn start_server_thread(port: u16, use_zero_copy: bool) {
             let cache_manager = CacheManager::new(metadata_cache, page_cache);
             let self_id = NodeId::new("127.0.0.1", port);
             let membership =
-                ClusterMembership::new(self_id, 150, DiscoveryMode::Static { peers: vec![] });
+                ClusterMembership::new(Box::new(StaticMembership::new(self_id, vec![])), 150);
 
             // Rc<RefCell<>> for sharing within the same monoio thread (no Send needed)
             let cm = Rc::new(RefCell::new(cache_manager));

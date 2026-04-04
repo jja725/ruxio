@@ -1,10 +1,17 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
+
+use crate::retry::RetryPolicy;
+
+use ruxio_common::metrics::{GCS_RETRIES, GCS_TIMEOUTS};
 
 /// Object metadata from GCS.
 #[derive(Debug, Clone)]
@@ -37,6 +44,10 @@ pub struct GcsClient {
     bucket: String,
     access_token: Option<String>,
     tls_config: Arc<rustls::ClientConfig>,
+    /// Connection pool: (TLS stream, last used timestamp).
+    pool: RefCell<VecDeque<(monoio_rustls::ClientTlsStream<TcpStream>, Instant)>>,
+    max_idle: usize,
+    idle_timeout: Duration,
 }
 
 impl GcsClient {
@@ -54,11 +65,21 @@ impl GcsClient {
             bucket: bucket.into(),
             access_token,
             tls_config: Arc::new(tls_config),
+            pool: RefCell::new(VecDeque::new()),
+            max_idle: 4,
+            idle_timeout: Duration::from_secs(60),
         }
     }
 
     pub fn with_access_token(mut self, token: impl Into<String>) -> Self {
         self.access_token = Some(token.into());
+        self
+    }
+
+    /// Configure connection pool size and idle timeout.
+    pub fn with_pool_config(mut self, max_idle: usize, idle_timeout_secs: u64) -> Self {
+        self.max_idle = max_idle;
+        self.idle_timeout = Duration::from_secs(idle_timeout_secs);
         self
     }
 
@@ -76,7 +97,7 @@ impl GcsClient {
              Host: storage.googleapis.com\r\n\
              Range: {}\r\n\
              {}\
-             Connection: close\r\n\
+             Connection: keep-alive\r\n\
              \r\n",
             self.bucket,
             encoded_path,
@@ -84,7 +105,7 @@ impl GcsClient {
             self.auth_header(),
         );
 
-        let mut stream = self.connect_tls().await?;
+        let mut stream = self.get_connection().await?;
 
         // Send request
         let (result, _) = stream.write_all(request.into_bytes()).await;
@@ -94,9 +115,13 @@ impl GcsClient {
         let (status, body) = read_http_response(&mut stream, expected_len).await?;
 
         if status < 200 || status >= 300 {
+            // Don't return connection to pool on error
             let body_str = String::from_utf8_lossy(&body);
             anyhow::bail!("GCS returned HTTP {status}: {body_str}");
         }
+
+        // Return connection to pool for reuse
+        self.return_connection(stream);
 
         Ok(body)
     }
@@ -110,14 +135,14 @@ impl GcsClient {
             "GET /storage/v1/b/{}/o/{} HTTP/1.1\r\n\
              Host: storage.googleapis.com\r\n\
              {}\
-             Connection: close\r\n\
+             Connection: keep-alive\r\n\
              \r\n",
             self.bucket,
             encoded_path,
             self.auth_header(),
         );
 
-        let mut stream = self.connect_tls().await?;
+        let mut stream = self.get_connection().await?;
 
         let (result, _) = stream.write_all(request.into_bytes()).await;
         result.context("failed to send GCS head request")?;
@@ -128,6 +153,8 @@ impl GcsClient {
             let body_str = String::from_utf8_lossy(&body);
             anyhow::bail!("GCS metadata returned HTTP {status}: {body_str}");
         }
+
+        self.return_connection(stream);
 
         let meta: GcsObjectMeta =
             serde_json::from_slice(&body).context("failed to parse GCS metadata response")?;
@@ -152,14 +179,14 @@ impl GcsClient {
             "GET /storage/v1/b/{}/o?prefix={} HTTP/1.1\r\n\
              Host: storage.googleapis.com\r\n\
              {}\
-             Connection: close\r\n\
+             Connection: keep-alive\r\n\
              \r\n",
             self.bucket,
             encoded_prefix,
             self.auth_header(),
         );
 
-        let mut stream = self.connect_tls().await?;
+        let mut stream = self.get_connection().await?;
 
         let (result, _) = stream.write_all(request.into_bytes()).await;
         result.context("failed to send GCS list request")?;
@@ -170,6 +197,8 @@ impl GcsClient {
             let body_str = String::from_utf8_lossy(&body);
             anyhow::bail!("GCS list returned HTTP {status}: {body_str}");
         }
+
+        self.return_connection(stream);
 
         #[derive(serde::Deserialize)]
         struct ListResponse {
@@ -190,6 +219,108 @@ impl GcsClient {
                 content_type: o.content_type,
             })
             .collect())
+    }
+
+    // ── Connection pool ──────────────────────────────────────────────
+
+    /// Get a TLS connection, reusing from pool if available.
+    async fn get_connection(&self) -> Result<monoio_rustls::ClientTlsStream<TcpStream>> {
+        // Try to reuse a pooled connection
+        while let Some((stream, last_used)) = self.pool.borrow_mut().pop_front() {
+            if last_used.elapsed() < self.idle_timeout {
+                return Ok(stream);
+            }
+            // Connection too old, drop it
+        }
+        // No pooled connection available, create new
+        self.connect_tls().await
+    }
+
+    /// Return a connection to the pool for reuse.
+    fn return_connection(&self, stream: monoio_rustls::ClientTlsStream<TcpStream>) {
+        let mut pool = self.pool.borrow_mut();
+        if pool.len() < self.max_idle {
+            pool.push_back((stream, Instant::now()));
+        }
+        // If pool is full, just drop the connection
+    }
+
+    // ── Retry wrappers ──────────────────────────────────────────────
+
+    /// Fetch a byte range with retry and timeout.
+    pub async fn get_range_with_retry(
+        &self,
+        path: &str,
+        range: Range<u64>,
+        policy: &RetryPolicy,
+    ) -> Result<Bytes> {
+        for attempt in 0..=policy.max_retries {
+            if attempt > 0 {
+                monoio::time::sleep(policy.delay_for_attempt(attempt - 1)).await;
+            }
+            match monoio::time::timeout(policy.timeout(), self.get_range(path, range.clone())).await
+            {
+                Ok(Ok(data)) => return Ok(data),
+                Ok(Err(e)) => {
+                    GCS_RETRIES.inc();
+                    if attempt == policy.max_retries {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "GCS get_range retry {}/{}: {e}",
+                        attempt + 1,
+                        policy.max_retries
+                    );
+                }
+                Err(_) => {
+                    GCS_TIMEOUTS.inc();
+                    if attempt == policy.max_retries {
+                        anyhow::bail!(
+                            "GCS get_range timeout after {} retries ({}s each)",
+                            policy.max_retries,
+                            policy.timeout_secs
+                        );
+                    }
+                    tracing::warn!(
+                        "GCS get_range timeout, retry {}/{}",
+                        attempt + 1,
+                        policy.max_retries
+                    );
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    /// HEAD request with retry and timeout.
+    pub async fn head_with_retry(&self, path: &str, policy: &RetryPolicy) -> Result<ObjectMeta> {
+        for attempt in 0..=policy.max_retries {
+            if attempt > 0 {
+                monoio::time::sleep(policy.delay_for_attempt(attempt - 1)).await;
+            }
+            match monoio::time::timeout(policy.timeout(), self.head(path)).await {
+                Ok(Ok(meta)) => return Ok(meta),
+                Ok(Err(e)) => {
+                    GCS_RETRIES.inc();
+                    if attempt == policy.max_retries {
+                        return Err(e);
+                    }
+                    tracing::warn!("GCS head retry {}/{}: {e}", attempt + 1, policy.max_retries);
+                }
+                Err(_) => {
+                    GCS_TIMEOUTS.inc();
+                    if attempt == policy.max_retries {
+                        anyhow::bail!("GCS head timeout after {} retries", policy.max_retries);
+                    }
+                    tracing::warn!(
+                        "GCS head timeout, retry {}/{}",
+                        attempt + 1,
+                        policy.max_retries
+                    );
+                }
+            }
+        }
+        unreachable!()
     }
 
     fn auth_header(&self) -> String {

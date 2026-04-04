@@ -13,6 +13,12 @@ lazy_static! {
     pub static ref SETTINGS: Settings = Settings::new().unwrap();
 }
 
+/// Top-level configuration.
+///
+/// Loaded from (in order of priority):
+/// 1. TOML config file (path from `RUXIO_CONFIG` env var, default `ruxio_config.toml`)
+/// 2. Environment variables with `RUXIO_` prefix (e.g., `RUXIO_DATA_PORT=51234`)
+///    Nested keys use `__` separator (e.g., `RUXIO_CACHE__PAGE_SIZE_BYTES=4194304`)
 #[derive(Clone, Debug, Deserialize)]
 #[allow(unused)]
 pub struct Settings {
@@ -22,14 +28,20 @@ pub struct Settings {
     pub local_ip: String,
     pub control_port: u16,
     pub data_port: u16,
+    pub http_port: u16,
+    pub threads: usize,
     pub service_discovery_type: String,
     pub etcd_uris: Vec<String>,
+    pub etcd_prefix: String,
     pub static_service_list: Vec<String>,
     pub metrics_push_uri: Option<String>,
     pub cache: CacheSettings,
     pub gcs: GcsSettings,
+    pub server: ServerSettings,
+    pub cluster: ClusterSettings,
 }
 
+/// Page cache and metadata cache configuration.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CacheSettings {
     pub page_size_bytes: usize,
@@ -37,14 +49,39 @@ pub struct CacheSettings {
     pub max_metadata_entries: usize,
     pub metadata_ttl_secs: u64,
     pub root_path: String,
+    pub eviction_policy: String,
+    pub restore_on_startup: bool,
 }
 
+/// GCS client configuration.
 #[derive(Clone, Debug, Deserialize)]
 pub struct GcsSettings {
     pub bucket: String,
     pub max_idle_connections: usize,
     pub idle_timeout_secs: u64,
     pub credentials_path: Option<String>,
+    pub max_retries: u32,
+    pub retry_base_delay_ms: u64,
+    pub retry_max_delay_ms: u64,
+    pub request_timeout_secs: u64,
+}
+
+/// Server networking and connection settings.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ServerSettings {
+    pub idle_timeout_secs: u64,
+    pub max_inflight_bytes: u64,
+    pub max_connections_per_thread: u32,
+}
+
+/// Cluster membership settings.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClusterSettings {
+    pub vnodes_per_node: usize,
+    pub etcd_lease_ttl_secs: u64,
+    pub prefetch_pages: u64,
+    pub max_prefetch_tasks: u32,
+    pub inflight_timeout_secs: u64,
 }
 
 impl Default for CacheSettings {
@@ -55,6 +92,8 @@ impl Default for CacheSettings {
             max_metadata_entries: 100_000,
             metadata_ttl_secs: 300,
             root_path: "/tmp/ruxio_cache".into(),
+            eviction_policy: "lru".into(),
+            restore_on_startup: true,
         }
     }
 }
@@ -63,73 +102,152 @@ impl Default for GcsSettings {
     fn default() -> Self {
         Self {
             bucket: String::new(),
-            max_idle_connections: 8,
+            max_idle_connections: 4,
             idle_timeout_secs: 60,
             credentials_path: None,
+            max_retries: 5,
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
+            request_timeout_secs: 30,
+        }
+    }
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 300,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            max_connections_per_thread: 10_000,
+        }
+    }
+}
+
+impl Default for ClusterSettings {
+    fn default() -> Self {
+        Self {
+            vnodes_per_node: 150,
+            etcd_lease_ttl_secs: 10,
+            prefetch_pages: 4,
+            max_prefetch_tasks: 16,
+            inflight_timeout_secs: 30,
         }
     }
 }
 
 impl From<Config> for Settings {
     fn from(config: Config) -> Self {
-        let debug = config.get_bool("is_debug").unwrap_or(false);
+        let debug = config.get_bool("debug").unwrap_or(false);
         let log_level = config
             .get::<String>("log_level")
-            .unwrap_or_else(|_| "INFO".into());
+            .unwrap_or_else(|_| "info".into());
         let hostname = config
-            .get::<String>("ruxio_hostname")
+            .get::<String>("hostname")
             .unwrap_or_else(|_| hostname::get().unwrap().into_string().unwrap());
         let local_ip = config
             .get::<String>("local_ip")
             .unwrap_or_else(|_| local_ip().unwrap().to_string());
-        let control_port = config.get::<u16>("control_port").unwrap_or(8080);
-        let data_port = config.get::<u16>("data_port").unwrap_or(8081);
+        let control_port = config.get::<u16>("control_port").unwrap_or(51235);
+        let data_port = config.get::<u16>("data_port").unwrap_or(51234);
+        let http_port = config.get::<u16>("http_port").unwrap_or(51236);
+        let threads = config.get::<usize>("threads").unwrap_or(16);
         let service_discovery_type = config
             .get_string("service_discovery_type")
             .unwrap_or_else(|_| "static".into());
-        let static_service_list = if service_discovery_type == "static" {
-            config
-                .get_string("static_service_list")
-                .unwrap_or_else(|_| format!("localhost:{}", control_port))
-                .split(',')
-                .map(String::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let etcd_uris = if service_discovery_type == "etcd" {
-            config
-                .get_string("etcd_uris")
-                .unwrap_or_else(|_| "localhost:2379".into())
-                .split(',')
-                .map(String::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let etcd_prefix = config
+            .get_string("etcd_prefix")
+            .unwrap_or_else(|_| "/ruxio/nodes/".into());
+        let static_service_list = config
+            .get_string("static_service_list")
+            .map(|s| s.split(',').map(String::from).collect())
+            .unwrap_or_default();
+        let etcd_uris = config
+            .get_string("etcd_uris")
+            .map(|s| s.split(',').map(String::from).collect())
+            .unwrap_or_default();
         let metrics_push_uri = config.get_string("metrics_push_uri").ok();
 
+        let cache_defaults = CacheSettings::default();
         let cache = CacheSettings {
             page_size_bytes: config
                 .get::<usize>("cache.page_size_bytes")
-                .unwrap_or(4 * 1024 * 1024),
+                .unwrap_or(cache_defaults.page_size_bytes),
             max_cache_bytes: config
                 .get::<u64>("cache.max_cache_bytes")
-                .unwrap_or(10 * 1024 * 1024 * 1024),
+                .unwrap_or(cache_defaults.max_cache_bytes),
             max_metadata_entries: config
                 .get::<usize>("cache.max_metadata_entries")
-                .unwrap_or(100_000),
-            metadata_ttl_secs: config.get::<u64>("cache.metadata_ttl_secs").unwrap_or(300),
+                .unwrap_or(cache_defaults.max_metadata_entries),
+            metadata_ttl_secs: config
+                .get::<u64>("cache.metadata_ttl_secs")
+                .unwrap_or(cache_defaults.metadata_ttl_secs),
             root_path: config
                 .get::<String>("cache.root_path")
-                .unwrap_or_else(|_| "/tmp/ruxio_cache".into()),
+                .unwrap_or(cache_defaults.root_path),
+            eviction_policy: config
+                .get::<String>("cache.eviction_policy")
+                .unwrap_or(cache_defaults.eviction_policy),
+            restore_on_startup: config
+                .get::<bool>("cache.restore_on_startup")
+                .unwrap_or(cache_defaults.restore_on_startup),
         };
 
+        let gcs_defaults = GcsSettings::default();
         let gcs = GcsSettings {
-            bucket: config.get::<String>("gcs.bucket").unwrap_or_default(),
-            max_idle_connections: config.get::<usize>("gcs.max_idle_connections").unwrap_or(8),
-            idle_timeout_secs: config.get::<u64>("gcs.idle_timeout_secs").unwrap_or(60),
+            bucket: config
+                .get::<String>("gcs.bucket")
+                .unwrap_or(gcs_defaults.bucket),
+            max_idle_connections: config
+                .get::<usize>("gcs.max_idle_connections")
+                .unwrap_or(gcs_defaults.max_idle_connections),
+            idle_timeout_secs: config
+                .get::<u64>("gcs.idle_timeout_secs")
+                .unwrap_or(gcs_defaults.idle_timeout_secs),
             credentials_path: config.get::<String>("gcs.credentials_path").ok(),
+            max_retries: config
+                .get::<u32>("gcs.max_retries")
+                .unwrap_or(gcs_defaults.max_retries),
+            retry_base_delay_ms: config
+                .get::<u64>("gcs.retry_base_delay_ms")
+                .unwrap_or(gcs_defaults.retry_base_delay_ms),
+            retry_max_delay_ms: config
+                .get::<u64>("gcs.retry_max_delay_ms")
+                .unwrap_or(gcs_defaults.retry_max_delay_ms),
+            request_timeout_secs: config
+                .get::<u64>("gcs.request_timeout_secs")
+                .unwrap_or(gcs_defaults.request_timeout_secs),
+        };
+
+        let server_defaults = ServerSettings::default();
+        let server = ServerSettings {
+            idle_timeout_secs: config
+                .get::<u64>("server.idle_timeout_secs")
+                .unwrap_or(server_defaults.idle_timeout_secs),
+            max_inflight_bytes: config
+                .get::<u64>("server.max_inflight_bytes")
+                .unwrap_or(server_defaults.max_inflight_bytes),
+            max_connections_per_thread: config
+                .get::<u32>("server.max_connections_per_thread")
+                .unwrap_or(server_defaults.max_connections_per_thread),
+        };
+
+        let cluster_defaults = ClusterSettings::default();
+        let cluster = ClusterSettings {
+            vnodes_per_node: config
+                .get::<usize>("cluster.vnodes_per_node")
+                .unwrap_or(cluster_defaults.vnodes_per_node),
+            etcd_lease_ttl_secs: config
+                .get::<u64>("cluster.etcd_lease_ttl_secs")
+                .unwrap_or(cluster_defaults.etcd_lease_ttl_secs),
+            prefetch_pages: config
+                .get::<u64>("cluster.prefetch_pages")
+                .unwrap_or(cluster_defaults.prefetch_pages),
+            max_prefetch_tasks: config
+                .get::<u32>("cluster.max_prefetch_tasks")
+                .unwrap_or(cluster_defaults.max_prefetch_tasks),
+            inflight_timeout_secs: config
+                .get::<u64>("cluster.inflight_timeout_secs")
+                .unwrap_or(cluster_defaults.inflight_timeout_secs),
         };
 
         let settings = Settings {
@@ -139,12 +257,17 @@ impl From<Config> for Settings {
             local_ip,
             control_port,
             data_port,
+            http_port,
+            threads,
             service_discovery_type,
             etcd_uris,
+            etcd_prefix,
             static_service_list,
             metrics_push_uri,
             cache,
             gcs,
+            server,
+            cluster,
         };
         info!("Settings loaded {:?}", settings);
         settings

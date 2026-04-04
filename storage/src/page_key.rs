@@ -3,6 +3,15 @@ use std::sync::Arc;
 
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
 /// Key for page cache lookups.
 ///
 /// Identifies a specific page within a remote file using Alluxio-style
@@ -52,6 +61,23 @@ impl PageKey {
             }
         }
         encoded
+    }
+
+    /// Decode a URL-safe file ID back to the original.
+    pub fn decode_url_safe(encoded: &str) -> String {
+        let mut result = String::with_capacity(encoded.len());
+        let mut chars = encoded.bytes();
+        while let Some(b) = chars.next() {
+            if b == b'%' {
+                let hi = chars.next().unwrap_or(b'0');
+                let lo = chars.next().unwrap_or(b'0');
+                let byte = hex_val(hi) << 4 | hex_val(lo);
+                result.push(byte as char);
+            } else {
+                result.push(b as char);
+            }
+        }
+        result
     }
 
     /// Hash bucket for the file_id (0..999) to distribute across directories.

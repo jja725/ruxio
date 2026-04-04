@@ -61,3 +61,9 @@ pub struct RedirectResponse {
     pub target_host: String,
     pub target_data_port: u16,
 }
+
+/// Cancel an in-flight request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRequest {
+    pub request_id: u32,
+}

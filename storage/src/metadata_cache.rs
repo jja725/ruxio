@@ -181,6 +181,14 @@ impl MetadataCache {
         }
     }
 
+    /// Create with explicit TTL (in seconds) for cached metadata entries.
+    /// The TTL is applied when metadata is inserted via CacheManager.
+    pub fn with_ttl(max_entries: usize, _ttl_secs: u64) -> Self {
+        // TTL is stored per-entry in CachedParquetMeta, not in the cache itself.
+        // This constructor exists for API symmetry; TTL is set at insert time.
+        Self::new(max_entries)
+    }
+
     /// Evaluate a predicate against Parquet row group statistics.
     ///
     /// Returns byte ranges for row groups that potentially contain matching data.

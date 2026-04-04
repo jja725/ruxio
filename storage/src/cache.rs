@@ -18,6 +18,8 @@ use crate::page_key::PageKey;
 pub struct CacheManager {
     pub metadata_cache: MetadataCache,
     pub page_cache: PageCache,
+    /// Metadata TTL in seconds.
+    metadata_ttl_secs: u64,
 }
 
 /// Result of a cached range read.
@@ -47,6 +49,16 @@ impl CacheManager {
         Self {
             metadata_cache,
             page_cache,
+            metadata_ttl_secs: 300,
+        }
+    }
+
+    /// Create with explicit metadata TTL.
+    pub fn with_ttl(metadata_cache: MetadataCache, page_cache: PageCache, ttl_secs: u64) -> Self {
+        Self {
+            metadata_cache,
+            page_cache,
+            metadata_ttl_secs: ttl_secs,
         }
     }
 
@@ -196,7 +208,10 @@ impl CacheManager {
         let size = data.len() as u64;
         let local_path = match self.page_cache.write_page_to_disk(key, data) {
             Ok(p) => p,
-            Err(_) => self.page_cache.page_path(key),
+            Err(_) => {
+                ruxio_common::metrics::CACHE_PUT_ERRORS.inc();
+                self.page_cache.page_path(key)
+            }
         };
 
         let cached_page = CachedPage { local_path, size };
@@ -235,7 +250,7 @@ impl CacheManager {
             file_size,
             etag,
             cached_at: std::time::Instant::now(),
-            ttl: std::time::Duration::from_secs(300),
+            ttl: std::time::Duration::from_secs(self.metadata_ttl_secs),
         };
 
         self.metadata_cache.put(uri.to_string(), cached.clone());

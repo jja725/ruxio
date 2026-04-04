@@ -3,6 +3,11 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ruxio_common::metrics::{
+    BYTES_EVICTED, CACHE_DELETE_ERRORS, CACHE_PUT_ERRORS, PAGES_EVICTED, PAGE_CACHE_BYTES,
+    PAGE_CACHE_CAPACITY_BYTES, PAGE_CACHE_PAGES,
+};
+
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
 use crate::cache_trait::Cache;
@@ -437,7 +442,7 @@ impl PageCache {
             EvictionPolicy::ClockPro => EvictionState::ClockPro(ClockProState::new()),
             EvictionPolicy::Lru => EvictionState::Lru(LruState::new()),
         };
-        Self {
+        let cache = Self {
             root: root.into(),
             max_bytes,
             used_bytes: 0,
@@ -447,7 +452,9 @@ impl PageCache {
             frequency_sketch: CountMinSketch::new(10 * CMS_WIDTH as u64),
             files: HashMap::new(),
             created_dirs: HashSet::new(),
-        }
+        };
+        PAGE_CACHE_CAPACITY_BYTES.set(max_bytes as i64);
+        cache
     }
 
     pub fn page_size(&self) -> u64 {
@@ -518,7 +525,13 @@ impl PageCache {
                 if let Some(page) = self.pages.remove(&key) {
                     self.used_bytes -= size;
                     self.track_file_remove(&key, size);
-                    let _ = std::fs::remove_file(&page.local_path);
+                    if std::fs::remove_file(&page.local_path).is_err() {
+                        CACHE_DELETE_ERRORS.inc();
+                    }
+                    PAGES_EVICTED.inc();
+                    BYTES_EVICTED.inc_by(size as f64);
+                    PAGE_CACHE_BYTES.set(self.used_bytes as i64);
+                    PAGE_CACHE_PAGES.set(self.pages.len() as i64);
                 }
             } else {
                 break;
@@ -563,6 +576,8 @@ impl Cache for PageCache {
         self.track_file_add(&key, size);
         self.used_bytes += size;
         self.pages.insert(key, value);
+        PAGE_CACHE_BYTES.set(self.used_bytes as i64);
+        PAGE_CACHE_PAGES.set(self.pages.len() as i64);
         true
     }
 
@@ -579,7 +594,11 @@ impl Cache for PageCache {
         if let Some(page) = self.pages.remove(key) {
             self.used_bytes -= page.size;
             self.track_file_remove(key, page.size);
-            let _ = std::fs::remove_file(&page.local_path);
+            if std::fs::remove_file(&page.local_path).is_err() {
+                CACHE_DELETE_ERRORS.inc();
+            }
+            PAGE_CACHE_BYTES.set(self.used_bytes as i64);
+            PAGE_CACHE_PAGES.set(self.pages.len() as i64);
             Some(page)
         } else {
             None

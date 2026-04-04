@@ -5,16 +5,19 @@ mod http;
 use std::cell::RefCell;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use bytes::Bytes;
 use clap::Parser;
 use tracing::info;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
-use ruxio_cluster::membership::{ClusterMembership, DiscoveryMode};
+use ruxio_cluster::membership::ClusterMembership;
 use ruxio_cluster::ring::NodeId;
+use ruxio_cluster::static_membership::StaticMembership;
+use ruxio_common::settings::Settings;
 use ruxio_storage::cache::CacheManager;
 use ruxio_storage::cache_trait::Cache;
 use ruxio_storage::forwarding;
@@ -22,59 +25,17 @@ use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::MetadataCache;
 use ruxio_storage::page_cache::{CachedPage, EvictionPolicy, PageCache};
 use ruxio_storage::page_key::PageKey;
+use ruxio_storage::retry::RetryPolicy;
 
+/// Minimal CLI args — all real configuration lives in ruxio_config.toml or env vars.
 #[derive(Parser, Debug)]
 #[command(name = "ruxio-server", about = "Ruxio distributed cache server")]
 struct Args {
-    /// Data plane port (binary protocol)
-    #[arg(long, default_value_t = 51234)]
-    data_port: u16,
-
-    /// Health/stats HTTP port
-    #[arg(long, default_value_t = 51235)]
-    health_port: u16,
-
-    /// HTTP/1.1 data plane port (zero-copy sendfile)
-    #[arg(long, default_value_t = 51236)]
-    http_port: u16,
-
-    /// Number of worker threads (defaults to 16)
-    #[arg(long, default_value_t = 16)]
-    threads: usize,
-
-    /// GCS bucket name
+    /// Config file path (without extension). Also set via RUXIO_CONFIG env var.
     #[arg(long)]
-    bucket: Option<String>,
+    config: Option<String>,
 
-    /// Page cache root directory
-    #[arg(long, default_value = "/tmp/ruxio_cache")]
-    cache_dir: String,
-
-    /// Maximum cache size in bytes (total across all threads)
-    #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
-    max_cache_bytes: u64,
-
-    /// Maximum metadata cache entries
-    #[arg(long, default_value_t = 100_000)]
-    max_metadata_entries: usize,
-
-    /// Bind address
-    #[arg(long, default_value = "0.0.0.0")]
-    bind: String,
-
-    /// Static peer list (comma-separated host:port)
-    #[arg(long, value_delimiter = ',')]
-    peers: Vec<String>,
-
-    /// Page size in bytes (default 4MB)
-    #[arg(long, default_value_t = 4 * 1024 * 1024)]
-    page_size: u64,
-
-    /// Eviction policy: "clockpro" or "lru" (both use TinyLFU admission)
-    #[arg(long, default_value = "lru")]
-    eviction_policy: String,
-
-    /// Populate cache with test data for benchmarking (100 pages)
+    /// Populate cache with test data for benchmarking
     #[arg(long, default_value_t = false)]
     bench_populate: bool,
 }
@@ -101,14 +62,19 @@ fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads
 
     for i in 0..BENCH_NUM_PAGES {
         let key = PageKey::new(uri, i);
-        let local_path = page_cache
-            .write_page_to_disk(&key, &data)
-            .expect("failed to write bench page");
-        let page = CachedPage {
-            local_path,
-            size: page_size,
-        };
-        page_cache.put(key, page);
+        match page_cache.write_page_to_disk(&key, &data) {
+            Ok(local_path) => {
+                let page = CachedPage {
+                    local_path,
+                    size: page_size,
+                };
+                page_cache.put(key, page);
+            }
+            Err(e) => {
+                tracing::error!("Failed to write bench page {i}: {e}");
+                return;
+            }
+        }
     }
     info!(
         "Thread {thread_id} populated {} pages (owns '{uri}')",
@@ -116,21 +82,106 @@ fn populate_bench_data(page_cache: &mut PageCache, thread_id: usize, num_threads
     );
 }
 
+/// Scan existing cache directory and restore page index on startup.
+fn restore_cache_index(page_cache: &mut PageCache, cache_dir: &str, page_size: u64) -> usize {
+    let page_size_dir = std::path::Path::new(cache_dir).join(page_size.to_string());
+    if !page_size_dir.exists() {
+        return 0;
+    }
+
+    let mut restored = 0usize;
+    let buckets = match std::fs::read_dir(&page_size_dir) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    for bucket_entry in buckets.flatten() {
+        if !bucket_entry.path().is_dir() {
+            continue;
+        }
+        let file_dirs = match std::fs::read_dir(bucket_entry.path()) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for file_entry in file_dirs.flatten() {
+            if !file_entry.path().is_dir() {
+                continue;
+            }
+            let file_id =
+                PageKey::decode_url_safe(file_entry.file_name().to_str().unwrap_or_default());
+            if file_id.is_empty() {
+                continue;
+            }
+            let pages = match std::fs::read_dir(file_entry.path()) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for page_file in pages.flatten() {
+                let path = page_file.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let page_index: u64 = match path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(|s| s.parse().ok())
+                {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let size = match std::fs::metadata(&path) {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
+                if size > page_size * 2 || size == 0 {
+                    tracing::warn!("Skipping corrupt page file: {}", path.display());
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                let key = PageKey::new(&file_id, page_index);
+                let page = CachedPage {
+                    local_path: path,
+                    size,
+                };
+                page_cache.put(key, page);
+                restored += 1;
+            }
+        }
+    }
+    restored
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Set config path if provided via CLI
+    if let Some(config_path) = &args.config {
+        std::env::set_var("RUXIO_CONFIG", config_path);
+    }
+
+    // Load settings from config file + env vars
+    let settings = Settings::new()?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ruxio=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                format!("ruxio={}", settings.log_level)
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        tracing_subscriber::filter::Directive::from(
+                            tracing::level_filters::LevelFilter::INFO,
+                        )
+                    }),
+            ),
         )
         .init();
 
-    let addr = format!("{}:{}", args.bind, args.data_port);
-    let http_addr = format!("{}:{}", args.bind, args.http_port);
-    let threads = args.threads;
-    let page_size = args.page_size;
-    let eviction_policy = match args.eviction_policy.as_str() {
+    let bind = &settings.local_ip;
+    let addr = format!("{bind}:{}", settings.data_port);
+    let http_addr = format!("{bind}:{}", settings.http_port);
+    let threads = settings.threads;
+    let page_size = settings.cache.page_size_bytes as u64;
+    let eviction_policy = match settings.cache.eviction_policy.as_str() {
         "clockpro" | "clock-pro" => EvictionPolicy::ClockPro,
         "lru" => EvictionPolicy::Lru,
         other => {
@@ -140,61 +191,115 @@ fn main() -> Result<()> {
     };
 
     info!("Starting ruxio-server");
-    info!("  bind:         {addr}");
-    info!("  threads:      {threads}");
-    info!("  cache_dir:    {}", args.cache_dir);
-    info!("  max_cache:    {} bytes", args.max_cache_bytes);
+    info!("  bind:            {addr}");
+    info!("  threads:         {threads}");
+    info!("  cache_dir:       {}", settings.cache.root_path);
     info!(
-        "  page_size:    {} bytes ({} MB)",
+        "  max_cache:       {} bytes",
+        settings.cache.max_cache_bytes
+    );
+    info!(
+        "  page_size:       {} bytes ({} MB)",
         page_size,
         page_size / (1024 * 1024)
     );
-    info!("  eviction:     {:?}", eviction_policy);
-    info!("  http_port:    {}", args.http_port);
-    if args.bench_populate {
-        info!(
-            "  bench:        {} x {}MB pages (partitioned by hash)",
-            BENCH_NUM_PAGES,
-            page_size / (1024 * 1024)
-        );
-    }
+    info!("  eviction:        {}", settings.cache.eviction_policy);
+    info!("  http_port:       {}", settings.http_port);
+    info!(
+        "  max_connections: {}/thread",
+        settings.server.max_connections_per_thread
+    );
+    info!("  idle_timeout:    {}s", settings.server.idle_timeout_secs);
+    info!("  cache_restore:   {}", settings.cache.restore_on_startup);
 
-    std::fs::create_dir_all(&args.cache_dir)?;
-    let per_thread_cache_bytes = args.max_cache_bytes / threads as u64;
+    std::fs::create_dir_all(&settings.cache.root_path)?;
+    let per_thread_cache_bytes = settings.cache.max_cache_bytes / threads as u64;
+
+    // Set up graceful shutdown + readiness
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+
+    let shutdown_signal = shutdown.clone();
+    ctrlc::set_handler(move || {
+        info!("Shutdown signal received, draining...");
+        shutdown_signal.store(true, Ordering::SeqCst);
+    })
+    .expect("failed to set signal handler");
 
     // Start health HTTP endpoint
-    let health_addr = format!("{}:{}", args.bind, args.health_port);
-    control::start_health_server(health_addr);
+    let health_addr = format!("{bind}:{}", settings.control_port);
+    control::start_health_server(health_addr, ready.clone(), shutdown.clone());
 
-    // Create SPSC channel matrix for lock-free cross-thread forwarding
+    // Create SPSC channel matrix
     let channels = forwarding::create_channel_matrix(threads);
+
+    // Build server config from settings
+    let server_config = data::ServerConfig {
+        idle_timeout_secs: settings.server.idle_timeout_secs,
+        max_inflight_bytes: settings.server.max_inflight_bytes,
+        prefetch_pages: settings.cluster.prefetch_pages,
+        inflight_timeout_secs: settings.cluster.inflight_timeout_secs,
+        max_connections_per_thread: settings.server.max_connections_per_thread,
+        max_prefetch_tasks: settings.cluster.max_prefetch_tasks,
+    };
+
+    let retry_policy = RetryPolicy {
+        max_retries: settings.gcs.max_retries,
+        base_delay_ms: settings.gcs.retry_base_delay_ms,
+        max_delay_ms: settings.gcs.retry_max_delay_ms,
+        timeout_secs: settings.gcs.request_timeout_secs,
+    };
 
     // Spawn worker threads
     let mut handles = Vec::new();
     for thread_id in 0..threads {
         let addr = addr.clone();
-        let cache_dir = format!("{}/{thread_id}", args.cache_dir);
-        let bucket = args.bucket.clone().unwrap_or_default();
-        let bench_populate = args.bench_populate;
-        let max_metadata_entries = args.max_metadata_entries;
-        let bind = args.bind.clone();
-        let data_port = args.data_port;
-        let peers = args.peers.clone();
-        let channels = channels.clone();
         let http_addr = http_addr.clone();
+        let cache_dir = format!("{}/{thread_id}", settings.cache.root_path);
+        let bucket = settings.gcs.bucket.clone();
+        let bench_populate = args.bench_populate;
+        let max_metadata_entries = settings.cache.max_metadata_entries;
+        let metadata_ttl_secs = settings.cache.metadata_ttl_secs;
+        let cache_restore = settings.cache.restore_on_startup;
+        let gcs_pool_size = settings.gcs.max_idle_connections;
+        let gcs_idle_timeout_secs = settings.gcs.idle_timeout_secs;
+        let bind = settings.local_ip.clone();
+        let data_port = settings.data_port;
+        let peers = settings.static_service_list.clone();
+        let channels = channels.clone();
+        let shutdown = shutdown.clone();
+        let ready = ready.clone();
+        let server_config = server_config.clone();
+        let retry_policy = retry_policy.clone();
+        let discovery = settings.service_discovery_type.clone();
+        let etcd_endpoints = settings.etcd_uris.clone();
+        let etcd_prefix = settings.etcd_prefix.clone();
+        let etcd_lease_ttl = settings.cluster.etcd_lease_ttl_secs;
+        let vnodes = settings.cluster.vnodes_per_node;
 
         let handle = std::thread::Builder::new()
             .name(format!("ruxio-worker-{thread_id}"))
             .spawn(move || {
-                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                let mut rt = match monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                     .enable_timer()
                     .build()
-                    .unwrap();
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("Worker {thread_id}: failed to build runtime: {e}");
+                        return;
+                    }
+                };
 
                 rt.block_on(async move {
-                    std::fs::create_dir_all(&cache_dir).unwrap();
-                    let gcs = GcsClient::new(&bucket);
-                    let metadata_cache = MetadataCache::new(max_metadata_entries);
+                    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                        tracing::error!("Worker {thread_id}: failed to create cache dir: {e}");
+                        return;
+                    }
+                    let gcs = GcsClient::new(&bucket)
+                        .with_pool_config(gcs_pool_size, gcs_idle_timeout_secs);
+                    let metadata_cache =
+                        MetadataCache::with_ttl(max_metadata_entries, metadata_ttl_secs);
                     let mut page_cache = PageCache::with_policy(
                         &cache_dir,
                         per_thread_cache_bytes,
@@ -202,19 +307,48 @@ fn main() -> Result<()> {
                         eviction_policy,
                     );
 
+                    // Restore cache index from disk
+                    if cache_restore {
+                        let restored = restore_cache_index(&mut page_cache, &cache_dir, page_size);
+                        if restored > 0 {
+                            info!("Worker {thread_id}: restored {restored} cached pages from disk");
+                        }
+                    }
+
                     if bench_populate {
                         populate_bench_data(&mut page_cache, thread_id, threads);
                     }
 
-                    let cache_manager = CacheManager::new(metadata_cache, page_cache);
+                    let cache_manager =
+                        CacheManager::with_ttl(metadata_cache, page_cache, metadata_ttl_secs);
 
                     let self_id = NodeId::new(&bind, data_port);
-                    let discovery = if peers.is_empty() {
-                        DiscoveryMode::Static { peers: vec![] }
-                    } else {
-                        DiscoveryMode::Static { peers }
-                    };
-                    let membership = ClusterMembership::new(self_id, 150, discovery);
+                    let membership_service: Box<dyn ruxio_cluster::service::MembershipService> =
+                        match discovery.as_str() {
+                            "etcd" => {
+                                let config = ruxio_cluster::etcd::EtcdConfig {
+                                    endpoints: etcd_endpoints.clone(),
+                                    prefix: etcd_prefix.clone(),
+                                    lease_ttl_secs: etcd_lease_ttl,
+                                };
+                                Box::new(ruxio_cluster::etcd::EtcdMembership::new(
+                                    self_id.clone(),
+                                    config,
+                                ))
+                            }
+                            _ => {
+                                let peer_nodes: Vec<NodeId> = peers
+                                    .iter()
+                                    .filter(|p| *p != &self_id.0)
+                                    .map(|p| NodeId(p.clone()))
+                                    .collect();
+                                Box::new(StaticMembership::new(self_id.clone(), peer_nodes))
+                            }
+                        };
+                    let membership = ClusterMembership::new(membership_service, vnodes);
+                    if let Err(e) = membership.start() {
+                        tracing::warn!("Membership start failed: {e}, running standalone");
+                    }
 
                     let ctx = Rc::new(data::ThreadContext {
                         cache_manager: Rc::new(RefCell::new(cache_manager)),
@@ -225,9 +359,15 @@ fn main() -> Result<()> {
                         channels: channels.clone(),
                         inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
                         access_tracker: Rc::new(RefCell::new(std::collections::HashMap::new())),
+                        retry_policy,
+                        shutdown: shutdown.clone(),
+                        ready: ready.clone(),
+                        config: server_config,
+                        active_connections: Rc::new(AtomicU32::new(0)),
+                        prefetch_outstanding: Rc::new(AtomicU32::new(0)),
                     });
 
-                    // Spawn SPSC inbox processor — drains forwarded lookup requests
+                    // Spawn SPSC inbox processor
                     let ctx_inbox = ctx.clone();
                     monoio::spawn(async move {
                         loop {
@@ -241,29 +381,86 @@ fn main() -> Result<()> {
                         }
                     });
 
-                    let listener = monoio::net::TcpListener::bind(&addr).unwrap();
-                    let http_listener = monoio::net::TcpListener::bind(&http_addr).unwrap();
+                    // Spawn membership event poller
+                    let ctx_membership = ctx.clone();
+                    monoio::spawn(async move {
+                        loop {
+                            monoio::time::sleep(Duration::from_millis(100)).await;
+                            ctx_membership.membership.poll_events();
+                        }
+                    });
+
+                    let listener = match monoio::net::TcpListener::bind(&addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!(
+                                "Worker {thread_id}: failed to bind data port {addr}: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let http_listener = match monoio::net::TcpListener::bind(&http_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!(
+                                "Worker {thread_id}: failed to bind HTTP port {http_addr}: {e}"
+                            );
+                            return;
+                        }
+                    };
+
+                    // Mark server as ready
+                    ready.store(true, Ordering::SeqCst);
                     info!("Worker {thread_id} ready");
 
                     // Spawn HTTP/1.1 listener
                     let ctx_http = ctx.clone();
+                    let shutdown_http = shutdown.clone();
                     monoio::spawn(async move {
                         loop {
-                            let (stream, _) = http_listener.accept().await.unwrap();
-                            let ctx = ctx_http.clone();
-                            monoio::spawn(async move {
-                                http::serve_http_connection(stream, ctx).await;
-                            });
+                            if shutdown_http.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match monoio::time::timeout(
+                                Duration::from_secs(1),
+                                http_listener.accept(),
+                            )
+                            .await
+                            {
+                                Ok(Ok((stream, _))) => {
+                                    let ctx = ctx_http.clone();
+                                    monoio::spawn(async move {
+                                        http::serve_http_connection(stream, ctx).await;
+                                    });
+                                }
+                                Ok(Err(e)) => tracing::warn!("HTTP accept error: {e}"),
+                                Err(_) => continue,
+                            }
                         }
                     });
 
+                    // Main accept loop
                     loop {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        let ctx = ctx.clone();
-                        monoio::spawn(async move {
-                            data::serve_connection(stream, ctx).await;
-                        });
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match monoio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                        {
+                            Ok(Ok((stream, _))) => {
+                                let ctx = ctx.clone();
+                                monoio::spawn(async move {
+                                    data::serve_connection(stream, ctx).await;
+                                });
+                            }
+                            Ok(Err(e)) => tracing::warn!("Accept error: {e}"),
+                            Err(_) => continue,
+                        }
                     }
+
+                    // Graceful shutdown
+                    ready.store(false, Ordering::SeqCst);
+                    info!("Worker {thread_id} shutting down");
+                    ctx.membership.leave();
                 });
             })?;
         handles.push(handle);
@@ -272,7 +469,9 @@ fn main() -> Result<()> {
     info!("Server ready: {threads} threads on {addr}");
 
     for h in handles {
-        h.join().unwrap();
+        if let Err(e) = h.join() {
+            tracing::error!("Worker thread panicked: {e:?}");
+        }
     }
     Ok(())
 }

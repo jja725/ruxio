@@ -110,6 +110,16 @@ impl HashRing {
     pub fn nodes(&self) -> &[NodeId] {
         &self.nodes
     }
+
+    /// Rebuild the ring from a complete member list.
+    /// Clears all existing nodes and re-adds the given members.
+    pub fn rebuild(&mut self, members: &[NodeId]) {
+        self.ring.clear();
+        self.nodes.clear();
+        for member in members {
+            self.add_node(member.clone());
+        }
+    }
 }
 
 fn hash_key(key: &str) -> u64 {

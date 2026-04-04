@@ -222,8 +222,11 @@ pub fn process_forwarded_requests(
 
             // Send reply back
             let resp = ForwardResponse { path: result };
-            // Reply queue should never be full (1:1 with requests)
-            let _ = channel.replies.try_push(resp);
+            if channel.replies.try_push(resp).is_err() {
+                tracing::warn!(
+                    "SPSC reply queue full (thread {my_thread} → {peer}), dropping response"
+                );
+            }
         }
     }
 }

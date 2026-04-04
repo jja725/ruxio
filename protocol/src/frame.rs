@@ -25,6 +25,10 @@ pub enum MessageType {
     Scan = 0x09,
     /// Batch scan with predicates.
     BatchScan = 0x0A,
+    /// Heartbeat (keepalive ping).
+    Heartbeat = 0x0B,
+    /// Cancel an in-flight request.
+    Cancel = 0x0C,
 }
 
 impl MessageType {
@@ -40,6 +44,8 @@ impl MessageType {
             0x08 => Ok(MessageType::Metadata),
             0x09 => Ok(MessageType::Scan),
             0x0A => Ok(MessageType::BatchScan),
+            0x0B => Ok(MessageType::Heartbeat),
+            0x0C => Ok(MessageType::Cancel),
             _ => Err(FrameError::UnknownMessageType(v)),
         }
     }
@@ -111,6 +117,15 @@ impl Frame {
         Frame {
             msg_type: MessageType::Done,
             request_id,
+            payload: Bytes::new(),
+        }
+    }
+
+    /// Create a Heartbeat frame (empty payload, request_id 0).
+    pub fn heartbeat() -> Self {
+        Frame {
+            msg_type: MessageType::Heartbeat,
+            request_id: 0,
             payload: Bytes::new(),
         }
     }
