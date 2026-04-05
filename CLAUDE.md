@@ -36,12 +36,6 @@ All tunables live in `common/src/settings.rs` as TOML + env vars. No CLI args fo
 - **GCS client**: HTTP/1.1 keep-alive pool, exponential backoff retry for transient errors (429, 5xx).
 - **Production hardening**: connection limits, idle timeout, flow control (64MB in-flight), corruption detection, cache restore, readiness probe, graceful shutdown.
 
-## Error Handling (Project-Specific)
-
-- Use `snafu` for all non-test error types. Use `anyhow` only in tests. `thiserror` is not used.
-- **Every error variant must carry `#[snafu(implicit)] location: Location`** for automatic file/line tracking. Use `#[snafu(visibility(pub))]` to generate public context selectors. See `storage/src/error.rs` for the canonical example.
-- **Use snafu context selectors** instead of direct construction: `.context(ConnectionSnafu { detail: "..." })?` for Result chains, `PageAssemblySnafu { detail }.fail()` for returning errors, `GcsSnafu.into_error(source)` for wrapping sources.
-
 ## Testing (Project-Specific)
 
 - Use `rstest` for parameterized tests with `#[case::{name}(...)]`.
@@ -81,6 +75,9 @@ The following conventions apply broadly to Rust projects.
 - Replace mutually exclusive boolean flags with a single enum/mode parameter.
 
 ### Error Handling
+- Use `snafu` for all non-test error types. Use `anyhow` only in tests.
+- **Every error variant must carry `#[snafu(implicit)] location: Location`** for automatic file/line tracking (Rust's equivalent of Java stack traces). Use `#[snafu(visibility(pub))]` to generate public context selectors.
+- **Use snafu context selectors** instead of direct construction: `.context(ConnectionSnafu { detail: "..." })?` for Result chains, `PageAssemblySnafu { detail }.fail()` for returning errors, `GcsSnafu.into_error(source)` for wrapping sources.
 - **Match error variants to root causes** with specific variants for monitoring — not a generic catch-all.
 - Include full context in error messages: values, sizes, types. `"Page offset {} exceeds file size {}"` not `"Invalid offset"`.
 - **No silent `let _ =` on `Result`** — log at `debug`/`warn` or increment a metric.
