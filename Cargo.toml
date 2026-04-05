@@ -4,6 +4,7 @@ members = [
     "protocol",
     "storage",
     "cluster",
+    "client",
     "server",
     "bench",
 ]
@@ -18,6 +19,7 @@ repository = "https://github.com/jja725/ruxio"
 [workspace.dependencies]
 # Internal crates
 ruxio-common = { path = "common" }
+ruxio-client = { path = "client" }
 ruxio-protocol = { path = "protocol" }
 ruxio-storage = { path = "storage" }
 ruxio-cluster = { path = "cluster" }

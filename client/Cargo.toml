@@ -1,0 +1,21 @@
+[package]
+name = "ruxio-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client-side reader for ruxio distributed Parquet cache"
+
+[lib]
+name = "ruxio_client"
+path = "src/lib.rs"
+
+[dependencies]
+ruxio-protocol = { workspace = true }
+ruxio-cluster = { workspace = true }
+monoio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tracing = { workspace = true }
