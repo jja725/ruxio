@@ -49,10 +49,6 @@ All tunables live in `common/src/settings.rs` as TOML + env vars. No CLI args fo
 - Hash ring tests: verify distribution uniformity and minimal disruption on node changes.
 - Frame codec tests: round-trip encoding, partial reads, error cases.
 
-## Commit Scopes (Project-Specific)
-
-- **Scopes**: `cache`, `gcs`, `protocol`, `cluster`, `server`, `bench`, `config`.
-
 ---
 
 ## General Rust Conventions
