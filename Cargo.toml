@@ -47,9 +47,6 @@ config = "0.14"
 prometheus = { version = "0.13", features = ["process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-log = "0.4"
-fern = { version = "0.7", features = ["colored"] }
-humantime = "2"
 
 # Error handling
 anyhow = "1"

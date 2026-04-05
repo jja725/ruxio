@@ -1,8 +1,8 @@
-use log::warn;
 use prometheus::{
     register_counter, register_histogram, register_int_counter_vec, register_int_gauge,
 };
 use prometheus::{Counter, Histogram, IntCounterVec, IntGauge, Opts, Registry};
+use tracing::warn;
 
 use lazy_static::lazy_static;
 

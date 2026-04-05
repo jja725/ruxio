@@ -7,7 +7,7 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 
 use local_ip_address::local_ip;
-use log::info;
+use tracing::info;
 
 /// Default port for control plane (health, metrics, readiness).
 const DEFAULT_CONTROL_PORT: u16 = 51_235;
