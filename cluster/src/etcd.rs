@@ -102,8 +102,9 @@ impl EtcdMembership {
                     while let Ok(cmd) = cmd_rx.recv() {
                         match cmd {
                             EtcdCommand::Join { reply } => {
-                                let _ = reply
-                                    .send(Err(MembershipError::ConnectionFailed(e.to_string())));
+                                let _ = reply.send(Err(MembershipError::ConnectionFailed {
+                                    message: e.to_string(),
+                                }));
                                 return;
                             }
                             EtcdCommand::Leave { reply } => {
@@ -111,8 +112,9 @@ impl EtcdMembership {
                                 return;
                             }
                             EtcdCommand::GetMembers { reply } => {
-                                let _ = reply
-                                    .send(Err(MembershipError::ConnectionFailed(e.to_string())));
+                                let _ = reply.send(Err(MembershipError::ConnectionFailed {
+                                    message: e.to_string(),
+                                }));
                             }
                             EtcdCommand::Shutdown => return,
                         }
@@ -155,7 +157,9 @@ impl EtcdMembership {
                                     }
                                 };
 
-                                let subs = subscribers_watch.lock().unwrap();
+                                let subs = subscribers_watch
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 for tx in subs.iter() {
                                     let _ = tx.send(event.clone());
                                 }
@@ -222,7 +226,9 @@ impl EtcdMembership {
         let lease = client
             .lease_grant(config.lease_ttl_secs as i64, None)
             .await
-            .map_err(|e| MembershipError::ConnectionFailed(format!("lease_grant: {e}")))?;
+            .map_err(|e| MembershipError::ConnectionFailed {
+                message: format!("lease_grant: {e}"),
+            })?;
         let lid = lease.id();
         *lease_id = Some(lid);
 
@@ -238,13 +244,18 @@ impl EtcdMembership {
         client
             .put(key.as_bytes(), value.as_bytes(), Some(put_options))
             .await
-            .map_err(|e| MembershipError::ConnectionFailed(format!("put: {e}")))?;
+            .map_err(|e| MembershipError::ConnectionFailed {
+                message: format!("put: {e}"),
+            })?;
 
         // Start keepalive
-        let (mut keeper, mut stream) = client
-            .lease_keep_alive(lid)
-            .await
-            .map_err(|e| MembershipError::ConnectionFailed(format!("keepalive: {e}")))?;
+        let (mut keeper, mut stream) =
+            client
+                .lease_keep_alive(lid)
+                .await
+                .map_err(|e| MembershipError::ConnectionFailed {
+                    message: format!("keepalive: {e}"),
+                })?;
 
         let keepalive_interval = Duration::from_secs(config.lease_ttl_secs / 3);
         let handle = tokio::spawn(async move {
@@ -289,7 +300,9 @@ impl EtcdMembership {
             client
                 .lease_revoke(lid)
                 .await
-                .map_err(|e| MembershipError::ConnectionFailed(format!("lease_revoke: {e}")))?;
+                .map_err(|e| MembershipError::ConnectionFailed {
+                    message: format!("lease_revoke: {e}"),
+                })?;
             tracing::info!("Deregistered from etcd: lease_id={lid}");
         }
         Ok(())
@@ -303,7 +316,9 @@ impl EtcdMembership {
         let resp = client
             .get(config.prefix.as_bytes(), Some(options))
             .await
-            .map_err(|e| MembershipError::ConnectionFailed(format!("get: {e}")))?;
+            .map_err(|e| MembershipError::ConnectionFailed {
+                message: format!("get: {e}"),
+            })?;
 
         let mut members = Vec::new();
         for kv in resp.kvs() {
@@ -325,30 +340,33 @@ impl MembershipService for EtcdMembership {
     fn join(&self) -> Result<(), MembershipError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send_cmd(EtcdCommand::Join { reply: reply_tx });
-        reply_rx
-            .recv()
-            .map_err(|_| MembershipError::Internal("bg thread died".to_string()))?
+        reply_rx.recv().map_err(|_| MembershipError::Internal {
+            message: "bg thread died".to_string(),
+        })?
     }
 
     fn leave(&self) -> Result<(), MembershipError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send_cmd(EtcdCommand::Leave { reply: reply_tx });
-        reply_rx
-            .recv()
-            .map_err(|_| MembershipError::Internal("bg thread died".to_string()))?
+        reply_rx.recv().map_err(|_| MembershipError::Internal {
+            message: "bg thread died".to_string(),
+        })?
     }
 
     fn get_live_members(&self) -> Result<Vec<NodeId>, MembershipError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send_cmd(EtcdCommand::GetMembers { reply: reply_tx });
-        reply_rx
-            .recv()
-            .map_err(|_| MembershipError::Internal("bg thread died".to_string()))?
+        reply_rx.recv().map_err(|_| MembershipError::Internal {
+            message: "bg thread died".to_string(),
+        })?
     }
 
     fn subscribe(&self) -> mpsc::Receiver<MembershipEvent> {
         let (tx, rx) = mpsc::channel();
-        self.subscribers.lock().unwrap().push(tx);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(tx);
         rx
     }
 

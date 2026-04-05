@@ -1625,7 +1625,7 @@ dependencies = [
  "monoio",
  "monoio-io-wrapper",
  "rustls",
- "thiserror 1.0.61",
+ "thiserror",
 ]
 
 [[package]]
@@ -1925,7 +1925,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "560131c633294438da9f7c4b08189194b20946c8274c6b9e38881a7874dc8ee8"
 dependencies = [
  "memchr",
- "thiserror 1.0.61",
+ "thiserror",
  "ucd-trie",
 ]
 
@@ -2120,7 +2120,7 @@ dependencies = [
  "parking_lot",
  "procfs",
  "protobuf",
- "thiserror 1.0.61",
+ "thiserror",
 ]
 
 [[package]]
@@ -2421,14 +2421,13 @@ dependencies = [
 name = "ruxio-cluster"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "etcd-client",
  "ruxio-common",
  "ruxio-protocol",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "snafu",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -2450,7 +2449,6 @@ dependencies = [
  "monoio",
  "prometheus",
  "serde",
- "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2463,7 +2461,7 @@ dependencies = [
  "ruxio-common",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "snafu",
  "xxhash-rust",
 ]
 
@@ -2495,7 +2493,6 @@ dependencies = [
 name = "ruxio-storage"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow",
  "bytes",
  "libc",
@@ -2507,7 +2504,7 @@ dependencies = [
  "ruxio-protocol",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "snafu",
  "tracing",
  "webpki-roots 0.26.11",
  "xxhash-rust",
@@ -2634,6 +2631,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
 
 [[package]]
+name = "snafu"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
+dependencies = [
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2707,16 +2725,7 @@ version = "1.0.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c546c80d6be4bc6a00c0f01730c08df82eaa7a7a61f11d656526506112cc1709"
 dependencies = [
- "thiserror-impl 1.0.61",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
-dependencies = [
- "thiserror-impl 2.0.18",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -2724,17 +2733,6 @@ name = "thiserror-impl"
 version = "1.0.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c3384250002a6d5af4d114f2845d37b57521033f30d5c3f46c4d70e1197533"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",

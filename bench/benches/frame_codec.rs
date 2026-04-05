@@ -8,7 +8,7 @@ fn bench_frame_encode(c: &mut Criterion) {
         offset: 4096,
         length: 4 * 1024 * 1024,
     };
-    let frame = Frame::new_json(MessageType::ReadRange, 1, &req);
+    let frame = Frame::new_json_unchecked(MessageType::ReadRange, 1, &req);
 
     c.bench_function("frame_encode", |b| {
         b.iter(|| {
@@ -23,7 +23,7 @@ fn bench_frame_decode(c: &mut Criterion) {
         offset: 4096,
         length: 4 * 1024 * 1024,
     };
-    let frame = Frame::new_json(MessageType::ReadRange, 1, &req);
+    let frame = Frame::new_json_unchecked(MessageType::ReadRange, 1, &req);
     let encoded = frame.encode();
 
     c.bench_function("frame_decode", |b| {

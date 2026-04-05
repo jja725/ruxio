@@ -15,8 +15,7 @@ ruxio-common = { workspace = true }
 ruxio-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
+snafu = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 etcd-client = { workspace = true }

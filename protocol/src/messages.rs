@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error_code::ErrorCode;
 use crate::predicate::PredicateExpr;
 
 /// Read a byte range from a cached file (engine already knows which bytes).
@@ -48,10 +49,15 @@ pub struct MetadataResponse {
     pub footer_size: u64,
 }
 
-/// Error response.
+/// Error response with structured error classification.
+///
+/// Follows Presto's pattern: every error carries a typed code with
+/// retryability metadata so clients can make informed retry decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    pub code: u32,
+    /// Structured error code with type and retryability.
+    pub error_code: ErrorCode,
+    /// Human-readable error message with context.
     pub message: String,
 }
 

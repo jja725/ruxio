@@ -1,5 +1,5 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use thiserror::Error;
+use snafu::Snafu;
 
 /// Message types for the data plane binary protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,7 @@ impl MessageType {
             0x0A => Ok(MessageType::BatchScan),
             0x0B => Ok(MessageType::Heartbeat),
             0x0C => Ok(MessageType::Cancel),
-            _ => Err(FrameError::UnknownMessageType(v)),
+            _ => Err(FrameError::UnknownMessageType { value: v }),
         }
     }
 }
@@ -75,11 +75,11 @@ pub const FRAME_HEADER_SIZE: usize = 9;
 /// Body header: 1 (type) + 4 (request_id) = 5 bytes
 const BODY_HEADER_SIZE: usize = 5;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Snafu)]
 pub enum FrameError {
-    #[error("unknown message type: 0x{0:02x}")]
-    UnknownMessageType(u8),
-    #[error("frame too large: {size} bytes (max {max})")]
+    #[snafu(display("unknown message type: 0x{value:02x}"))]
+    UnknownMessageType { value: u8 },
+    #[snafu(display("frame too large: {size} bytes (max {max})"))]
     TooLarge { size: usize, max: usize },
 }
 

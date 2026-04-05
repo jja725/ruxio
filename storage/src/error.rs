@@ -89,9 +89,9 @@ impl StorageError {
         use ruxio_protocol::error_code;
         match self {
             Self::Gcs { source } => match source {
-                GcsError::Transient(_) => error_code::gcs_transient_error(),
-                GcsError::Permanent(_) => error_code::gcs_permanent_error(),
-                GcsError::Timeout(_) => error_code::gcs_timeout(),
+                GcsError::Transient { .. } => error_code::gcs_transient_error(),
+                GcsError::Permanent { .. } => error_code::gcs_permanent_error(),
+                GcsError::Timeout { .. } => error_code::gcs_timeout(),
             },
             Self::DiskIo { .. } => error_code::disk_io_error(),
             Self::PageAssembly { .. } => error_code::page_not_cached(),

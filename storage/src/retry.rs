@@ -1,31 +1,30 @@
 use std::time::Duration;
 
 /// Structured GCS error types for retry classification.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, snafu::Snafu)]
 pub enum GcsError {
     /// Transient error — safe to retry (HTTP 429, 5xx, network errors).
-    #[error("transient: {0}")]
-    Transient(String),
+    #[snafu(display("transient: {message}"))]
+    Transient { message: String },
     /// Permanent error — do not retry (HTTP 4xx except 429).
-    #[error("permanent: {0}")]
-    Permanent(String),
+    #[snafu(display("permanent: {message}"))]
+    Permanent { message: String },
     /// Request timed out.
-    #[error("timeout after {0:?}")]
-    Timeout(Duration),
+    #[snafu(display("timeout after {duration:?}"))]
+    Timeout { duration: Duration },
 }
 
 impl GcsError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient(_) | Self::Timeout(_))
+        matches!(self, Self::Transient { .. } | Self::Timeout { .. })
     }
 
     /// Classify an HTTP status code into transient or permanent.
     pub fn from_status(status: u16, body: &str) -> Self {
+        let message = format!("HTTP {status}: {}", truncate(body, 200));
         match status {
-            429 | 500 | 502 | 503 | 504 => {
-                Self::Transient(format!("HTTP {status}: {}", truncate(body, 200)))
-            }
-            _ => Self::Permanent(format!("HTTP {status}: {}", truncate(body, 200))),
+            429 | 500 | 502 | 503 | 504 => Self::Transient { message },
+            _ => Self::Permanent { message },
         }
     }
 }
@@ -108,6 +107,9 @@ mod tests {
 
     #[test]
     fn test_timeout_is_retryable() {
-        assert!(GcsError::Timeout(Duration::from_secs(30)).is_retryable());
+        assert!(GcsError::Timeout {
+            duration: Duration::from_secs(30)
+        }
+        .is_retryable());
     }
 }

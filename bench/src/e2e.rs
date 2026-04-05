@@ -137,7 +137,7 @@ async fn serve_connection(
             // Buffered path (cache-only, no GCS in bench)
             let result = cache_manager.borrow_mut().read_range_cached(&req);
             match result {
-                RangeResult::Hit(data) => {
+                Ok(RangeResult::Hit(data)) => {
                     let chunk = Frame::new_raw(MessageType::DataChunk, rid, data);
                     let (r, _) = stream.write_all(chunk.encode().to_vec()).await;
                     if r.is_err() {
@@ -149,7 +149,7 @@ async fn serve_connection(
                         return;
                     }
                 }
-                RangeResult::Miss { .. } => {
+                Ok(RangeResult::Miss { .. }) | Err(_) => {
                     let done = Frame::done(rid);
                     let (r, _) = stream.write_all(done.encode().to_vec()).await;
                     if r.is_err() {
@@ -222,7 +222,7 @@ async fn send_and_recv(stream: &mut TcpStream, request_id: u32, page_offset: u64
         offset: page_offset,
         length: PAGE_SIZE,
     };
-    let frame = Frame::new_json(MessageType::ReadRange, request_id, &req);
+    let frame = Frame::new_json_unchecked(MessageType::ReadRange, request_id, &req);
     let encoded = frame.encode();
     let (result, _) = stream.write_all(encoded.to_vec()).await;
     if result.is_err() {

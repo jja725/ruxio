@@ -17,7 +17,7 @@ async fn send_and_recv(stream: &mut TcpStream, request_id: u32, page_offset: u64
         offset: page_offset,
         length: PAGE_SIZE,
     };
-    let frame = Frame::new_json(MessageType::ReadRange, request_id, &req);
+    let frame = Frame::new_json_unchecked(MessageType::ReadRange, request_id, &req);
     let (result, _) = stream.write_all(frame.encode().to_vec()).await;
     if result.is_err() {
         return 0;

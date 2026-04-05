@@ -144,7 +144,7 @@ Evaluate every change across three axes: **correctness & maintainability**, **sa
 
 - **No `.unwrap()` in production code** — use `match`, `if let`, `let...else`, or `?`. Reserve `.unwrap()` for tests only. If truly unavoidable, use `.expect("reason")`.
 - **No silent `let _ =` on `Result`** — log at `debug` or `warn` level, or increment an error metric.
-- Use `thiserror` for error types in libraries, `anyhow` for binaries and tests.
+- Use `snafu` for error types in all non-test code (libraries and binaries). Use `anyhow` only in tests. `thiserror` is not used in this project.
 - **Match error variants to root causes**: invalid input errors for caller data issues, corruption errors for integrity problems, not-found for missing resources, I/O errors for system failures. Do not use a generic catch-all. Use specific variants so failure frequencies can be tracked via Prometheus metrics — a single `StorageError::Io` is far less useful than `StorageError::ConnectionTimeout` vs `StorageError::DiskFull`.
 - Include full context in error messages: variable names, actual values, sizes, types, indices. `"Page offset {} exceeds file size {}"` not `"Invalid offset"`.
 - Validate inputs at API boundaries and reject invalid values with descriptive errors — never silently clamp, adjust, or default.

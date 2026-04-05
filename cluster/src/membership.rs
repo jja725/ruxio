@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::mpsc;
 
 use crate::ring::{HashRing, NodeId};
-use crate::service::{MembershipEvent, MembershipService};
+use crate::service::{MembershipError, MembershipEvent, MembershipService};
 
 /// Manages cluster membership and the consistent hash ring.
 ///
@@ -33,15 +33,10 @@ impl ClusterMembership {
     }
 
     /// Join the cluster and build the initial hash ring from live members.
-    pub fn start(&self) -> anyhow::Result<()> {
-        self.service
-            .join()
-            .map_err(|e| anyhow::anyhow!("membership join failed: {e}"))?;
+    pub fn start(&self) -> Result<(), MembershipError> {
+        self.service.join()?;
 
-        let members = self
-            .service
-            .get_live_members()
-            .map_err(|e| anyhow::anyhow!("get members failed: {e}"))?;
+        let members = self.service.get_live_members()?;
 
         self.ring.borrow_mut().rebuild(&members);
         ruxio_common::metrics::CLUSTER_MEMBERS.set(members.len() as i64);

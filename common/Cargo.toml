@@ -20,7 +20,6 @@ tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 lazy_static = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 config = { workspace = true }
 hostname = { workspace = true }
 local-ip-address = { workspace = true }

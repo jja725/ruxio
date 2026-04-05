@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cache_trait;
+pub mod error;
 pub mod forwarding;
 pub mod gcs;
 pub mod metadata_cache;

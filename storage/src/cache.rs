@@ -6,6 +6,7 @@ use bytes::Bytes;
 use ruxio_protocol::messages::ReadRangeRequest;
 
 use crate::cache_trait::Cache;
+use crate::error::StorageError;
 use crate::metadata_cache::{CachedParquetMeta, MetadataCache};
 use crate::page_cache::{CachedPage, PageCache};
 use crate::page_key::PageKey;
@@ -71,7 +72,10 @@ impl CacheManager {
     ///
     /// On full hit: reads pages from disk (served from OS page cache if hot).
     /// On miss: returns miss list with coalesced ranges for efficient GCS fetch.
-    pub fn read_range_cached(&mut self, req: &ReadRangeRequest) -> RangeResult {
+    pub fn read_range_cached(
+        &mut self,
+        req: &ReadRangeRequest,
+    ) -> crate::error::Result<RangeResult> {
         let page_size = self.page_size();
         let start = req.offset;
         let end = req.offset + req.length;
@@ -96,18 +100,21 @@ impl CacheManager {
 
         if !misses.is_empty() {
             let coalesced = Self::coalesce_ranges(&misses, page_size);
-            return RangeResult::Miss { misses, coalesced };
+            return Ok(RangeResult::Miss { misses, coalesced });
         }
 
         // Full hit — read from disk and assemble
-        RangeResult::Hit(self.assemble_from_disk(req))
+        Ok(RangeResult::Hit(self.assemble_from_disk(req)?))
     }
 
     /// Read pages from disk and assemble the requested byte range.
     ///
     /// Pages are read via std::fs::read — the OS page cache serves hot data
     /// from memory (~microseconds) and cold data from NVMe (~1ms per 4MB).
-    fn assemble_from_disk(&mut self, req: &ReadRangeRequest) -> Bytes {
+    ///
+    /// Returns an error if any page read fails, rather than silently
+    /// returning partial data.
+    fn assemble_from_disk(&mut self, req: &ReadRangeRequest) -> crate::error::Result<Bytes> {
         let page_size = self.page_size();
         let start = req.offset;
         let end = req.offset + req.length;
@@ -123,11 +130,15 @@ impl CacheManager {
             // Fast path: single full page — read directly, no slicing
             let key = PageKey::with_arc(file_id, first_page);
             if let Some(page) = self.page_cache.get(&key) {
-                if let Ok(data) = std::fs::read(&page.local_path) {
-                    return Bytes::from(data);
-                }
+                let data = std::fs::read(&page.local_path).map_err(|e| StorageError::DiskIo {
+                    path: page.local_path.display().to_string(),
+                    source: e,
+                })?;
+                return Ok(Bytes::from(data));
             }
-            return Bytes::new();
+            return Err(StorageError::PageAssembly {
+                detail: format!("page {} not found in cache for {}", first_page, req.uri),
+            });
         }
 
         // Multi-page or partial: read each page, slice, assemble
@@ -137,24 +148,32 @@ impl CacheManager {
             let page_offset = page_idx * page_size;
             let key = PageKey::with_arc(file_id.clone(), page_idx);
 
-            if let Some(page) = self.page_cache.get(&key) {
-                if let Ok(page_data) = std::fs::read(&page.local_path) {
-                    let page_end = page_offset + page_data.len() as u64;
-                    let slice_start = (start.max(page_offset) - page_offset) as usize;
-                    let slice_end = (end.min(page_end) - page_offset) as usize;
+            let page = self
+                .page_cache
+                .get(&key)
+                .ok_or_else(|| StorageError::PageAssembly {
+                    detail: format!("page {} not found in cache for {}", page_idx, req.uri),
+                })?;
 
-                    if slice_start < page_data.len() && slice_end <= page_data.len() {
-                        result.extend_from_slice(&page_data[slice_start..slice_end]);
-                    }
-                }
+            let page_data = std::fs::read(&page.local_path).map_err(|e| StorageError::DiskIo {
+                path: page.local_path.display().to_string(),
+                source: e,
+            })?;
+
+            let page_end = page_offset + page_data.len() as u64;
+            let slice_start = (start.max(page_offset) - page_offset) as usize;
+            let slice_end = (end.min(page_end) - page_offset) as usize;
+
+            if slice_start < page_data.len() && slice_end <= page_data.len() {
+                result.extend_from_slice(&page_data[slice_start..slice_end]);
             }
         }
 
-        Bytes::from(result)
+        Ok(Bytes::from(result))
     }
 
     /// Assemble a byte range after missing pages have been fetched and cached.
-    pub fn read_range_finish(&mut self, req: &ReadRangeRequest) -> Bytes {
+    pub fn read_range_finish(&mut self, req: &ReadRangeRequest) -> crate::error::Result<Bytes> {
         self.assemble_from_disk(req)
     }
 
@@ -240,9 +259,10 @@ impl CacheManager {
         footer_bytes: bytes::Bytes,
         file_size: u64,
         etag: Option<String>,
-    ) -> anyhow::Result<CachedParquetMeta> {
+    ) -> crate::error::Result<CachedParquetMeta> {
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
-            .parse_and_finish(&footer_bytes)?;
+            .parse_and_finish(&footer_bytes)
+            .map_err(|e| StorageError::MetadataParse { source: e })?;
 
         let cached = CachedParquetMeta {
             metadata: std::sync::Arc::new(metadata),

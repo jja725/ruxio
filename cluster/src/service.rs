@@ -12,16 +12,16 @@ pub enum MembershipEvent {
 }
 
 /// Errors from membership operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, snafu::Snafu)]
 pub enum MembershipError {
-    #[error("connection failed: {0}")]
-    ConnectionFailed(String),
-    #[error("lease expired")]
+    #[snafu(display("connection failed: {message}"))]
+    ConnectionFailed { message: String },
+    #[snafu(display("lease expired"))]
     LeaseExpired,
-    #[error("timeout")]
+    #[snafu(display("timeout"))]
     Timeout,
-    #[error("{0}")]
-    Internal(String),
+    #[snafu(display("{message}"))]
+    Internal { message: String },
 }
 
 /// Extensible membership service trait.

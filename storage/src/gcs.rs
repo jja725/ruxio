@@ -315,7 +315,9 @@ impl GcsClient {
                     GCS_TIMEOUTS.inc();
                     if attempt == policy.max_retries {
                         return Err(StorageError::Gcs {
-                            source: GcsError::Timeout(policy.timeout()),
+                            source: GcsError::Timeout {
+                                duration: policy.timeout(),
+                            },
                         });
                     }
                     tracing::warn!(
@@ -328,7 +330,9 @@ impl GcsClient {
         }
         // All retries exhausted (should not be reached due to loop logic above)
         Err(StorageError::Gcs {
-            source: GcsError::Timeout(policy.timeout()),
+            source: GcsError::Timeout {
+                duration: policy.timeout(),
+            },
         })
     }
 
@@ -360,7 +364,9 @@ impl GcsClient {
                     GCS_TIMEOUTS.inc();
                     if attempt == policy.max_retries {
                         return Err(StorageError::Gcs {
-                            source: GcsError::Timeout(policy.timeout()),
+                            source: GcsError::Timeout {
+                                duration: policy.timeout(),
+                            },
                         });
                     }
                     tracing::warn!(
@@ -372,7 +378,9 @@ impl GcsClient {
             }
         }
         Err(StorageError::Gcs {
-            source: GcsError::Timeout(policy.timeout()),
+            source: GcsError::Timeout {
+                duration: policy.timeout(),
+            },
         })
     }
 

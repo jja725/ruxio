@@ -53,7 +53,7 @@ humantime = "2"
 
 # Error handling
 anyhow = "1"
-thiserror = "2"
+snafu = "0.8"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
