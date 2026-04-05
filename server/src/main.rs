@@ -133,7 +133,12 @@ fn restore_cache_index(page_cache: &mut PageCache, cache_dir: &str, page_size: u
                 };
                 if size > page_size * 2 || size == 0 {
                     tracing::warn!("Skipping corrupt page file: {}", path.display());
-                    let _ = std::fs::remove_file(&path);
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!(
+                            "Failed to remove corrupt page file {}: {e}",
+                            path.display()
+                        );
+                    }
                     continue;
                 }
                 let key = PageKey::new(&file_id, page_index);
@@ -183,6 +188,9 @@ fn create_listener(
     #[cfg(target_os = "linux")]
     if settings.tcp_fastopen {
         let optval = settings.tcp_fastopen_qlen as libc::c_int;
+        // SAFETY: socket fd is valid (obtained from socket2::Socket), optval is a
+        // stack-allocated c_int with correct size passed via size_of. The setsockopt
+        // call only reads from the pointer for the specified length.
         unsafe {
             libc::setsockopt(
                 std::os::unix::io::AsRawFd::as_raw_fd(&socket),
@@ -199,6 +207,9 @@ fn create_listener(
     #[cfg(target_os = "linux")]
     {
         let timeout_ms = (settings.idle_timeout_secs * 1000) as libc::c_int;
+        // SAFETY: socket fd is valid (obtained from socket2::Socket), timeout_ms is a
+        // stack-allocated c_int with correct size passed via size_of. The setsockopt
+        // call only reads from the pointer for the specified length.
         unsafe {
             libc::setsockopt(
                 std::os::unix::io::AsRawFd::as_raw_fd(&socket),
@@ -256,7 +267,7 @@ fn main() -> Result<()> {
         "clockpro" | "clock-pro" => EvictionPolicy::ClockPro,
         "lru" => EvictionPolicy::Lru,
         other => {
-            eprintln!("Unknown eviction policy: {other}. Use 'clockpro' or 'lru'.");
+            tracing::error!("Unknown eviction policy: {other}. Use 'clockpro' or 'lru'.");
             std::process::exit(1);
         }
     };

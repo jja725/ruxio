@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use bytes::Bytes;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
@@ -20,6 +19,7 @@ use ruxio_common::metrics::{
     GCS_FETCH_COUNTER, GCS_FETCH_LATENCY, INCOMING_REQUESTS, INFLIGHT_COALESCED,
     METADATA_CACHE_HITS, METADATA_CACHE_MISSES, RESPONSE_TIME_COLLECTOR,
 };
+use ruxio_protocol::error_code;
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::{
     BatchReadRequest, ErrorResponse, GetMetadataRequest, MetadataResponse, ReadRangeRequest,
@@ -27,6 +27,7 @@ use ruxio_protocol::messages::{
 };
 use ruxio_storage::cache::{CacheManager, RangeResult};
 use ruxio_storage::cache_trait::Cache;
+use ruxio_storage::error::StorageError;
 use ruxio_storage::forwarding::{self, ChannelMatrix};
 use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::{CachedParquetMeta, MetadataCache};
@@ -35,6 +36,12 @@ use ruxio_storage::retry::RetryPolicy;
 use ruxio_storage::zero_copy;
 
 // ── Server configuration ────────────────────────────────────────────
+
+/// Initial receive buffer size for the binary data plane.
+const RECV_BUFFER_BYTES: usize = 128 * 1024;
+
+/// Parquet footer read size — large enough for most footers in a single fetch.
+const FOOTER_FETCH_BYTES: u64 = 64 * 1024;
 
 /// Runtime-configurable server settings (passed from config file).
 #[derive(Debug, Clone)]
@@ -160,11 +167,18 @@ impl RequestTracker {
         self.state == RequestState::Streaming
     }
 
-    fn error_frame(&self, code: u32, message: String) -> Frame {
-        Frame::new_json(
+    fn error_frame(
+        &self,
+        error_code: ruxio_protocol::error_code::ErrorCode,
+        message: String,
+    ) -> Frame {
+        Frame::new_json_unchecked(
             MessageType::Error,
             self.request_id,
-            &ErrorResponse { code, message },
+            &ErrorResponse {
+                error_code,
+                message,
+            },
         )
     }
 }
@@ -200,6 +214,14 @@ impl Drop for RequestGuard {
     }
 }
 
+/// Classify an error into a structured ErrorCode.
+///
+/// StorageError maps directly via `to_error_code()`.
+/// For any other error type, falls back to GENERIC_INTERNAL_ERROR.
+fn classify_error(err: &StorageError) -> ruxio_protocol::error_code::ErrorCode {
+    err.to_error_code()
+}
+
 /// Write a frame to the stream with a timeout. Returns bytes written or error.
 async fn write_frame_with_timeout(
     stream: &mut TcpStream,
@@ -216,6 +238,22 @@ async fn write_frame_with_timeout(
             "write timeout",
         )),
     }
+}
+
+/// Build an error response frame with structured error code.
+fn error_response_frame(
+    request_id: u32,
+    error_code: ruxio_protocol::error_code::ErrorCode,
+    message: String,
+) -> Frame {
+    Frame::new_json_unchecked(
+        MessageType::Error,
+        request_id,
+        &ErrorResponse {
+            error_code,
+            message,
+        },
+    )
 }
 
 pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
@@ -237,9 +275,11 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     };
 
     let mut stream = stream;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("set_nodelay failed: {e}");
+    }
     let mut reader = FrameReader::new();
-    let mut buf = vec![0u8; 128 * 1024];
+    let mut buf = vec![0u8; RECV_BUFFER_BYTES];
     let idle_timeout = Duration::from_secs(ctx.config.idle_timeout_secs);
     let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
     let high_water = ctx.config.write_buffer_high;
@@ -293,16 +333,19 @@ pub async fn serve_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
                     let batch_len = batch.len() as u64;
 
                     // Watermark-based backpressure (hysteresis):
+                    // Approximation: after sleeping, assume the kernel drained
+                    // at least low_water bytes. Accurate tracking would require
+                    // ioctl(TIOCOUTQ) which monoio doesn't expose yet.
                     if backpressured {
-                        while conn_bytes_pending > low_water {
-                            monoio::time::sleep(Duration::from_millis(1)).await;
-                            conn_bytes_pending = 0;
+                        monoio::time::sleep(Duration::from_millis(1)).await;
+                        conn_bytes_pending = conn_bytes_pending.saturating_sub(low_water);
+                        if conn_bytes_pending <= low_water {
+                            backpressured = false;
                         }
-                        backpressured = false;
                     } else if conn_bytes_pending >= high_water {
                         backpressured = true;
                         monoio::time::sleep(Duration::from_millis(1)).await;
-                        conn_bytes_pending = 0;
+                        conn_bytes_pending = conn_bytes_pending.saturating_sub(low_water);
                     }
 
                     // Single batched write with timeout
@@ -362,8 +405,11 @@ impl Drop for InflightGuard {
 
 /// Read a byte range. On cache miss, fetches from GCS and returns data
 /// immediately — disk caching happens asynchronously in the background.
-pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) -> Result<Bytes> {
-    let cache_result = ctx.cache_manager.borrow_mut().read_range_cached(req);
+pub(crate) async fn read_range(
+    ctx: &Rc<ThreadContext>,
+    req: &ReadRangeRequest,
+) -> std::result::Result<Bytes, StorageError> {
+    let cache_result = ctx.cache_manager.borrow_mut().read_range_cached(req)?;
 
     match cache_result {
         RangeResult::Hit(data) => {
@@ -490,19 +536,30 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
                                         page_size
                                     );
                                     ctx.cache_manager.borrow_mut().page_cache.remove(&key);
-                                    continue;
+                                    return Err(StorageError::PageAssembly {
+                                        detail: format!(
+                                            "corrupt page {} (size {} > expected {})",
+                                            path.display(),
+                                            data.len(),
+                                            page_size
+                                        ),
+                                    });
                                 }
                                 Bytes::from(data)
                             }
                             Err(e) => {
                                 CACHE_GET_ERRORS.inc();
-                                warn!("Page read error {}: {e}", path.display());
                                 ctx.cache_manager.borrow_mut().page_cache.remove(&key);
-                                continue;
+                                return Err(StorageError::DiskIo {
+                                    path: path.display().to_string(),
+                                    source: e,
+                                });
                             }
                         }
                     } else {
-                        continue;
+                        return Err(StorageError::PageAssembly {
+                            detail: format!("page {} not found in cache for {}", page_idx, req.uri),
+                        });
                     }
                 };
 
@@ -520,7 +577,10 @@ pub(crate) async fn read_range(ctx: &Rc<ThreadContext>, req: &ReadRangeRequest) 
 }
 
 /// Fetch metadata with cache check.
-pub(crate) async fn get_metadata(ctx: &ThreadContext, uri: &str) -> Result<CachedParquetMeta> {
+pub(crate) async fn get_metadata(
+    ctx: &ThreadContext,
+    uri: &str,
+) -> std::result::Result<CachedParquetMeta, StorageError> {
     if let Some(meta) = ctx.cache_manager.borrow_mut().get_metadata_cached(uri) {
         METADATA_CACHE_HITS.inc();
         return Ok(meta);
@@ -529,7 +589,7 @@ pub(crate) async fn get_metadata(ctx: &ThreadContext, uri: &str) -> Result<Cache
     METADATA_CACHE_MISSES.inc();
 
     let head = ctx.gcs.head_with_retry(uri, &ctx.retry_policy).await?;
-    let footer_size = 64 * 1024u64;
+    let footer_size = FOOTER_FETCH_BYTES;
     let footer_start = head.size.saturating_sub(footer_size);
     let footer_bytes = ctx
         .gcs
@@ -552,7 +612,7 @@ async fn scan_streaming(
     req: &ScanRequest,
     request_id: u32,
     stream: &mut TcpStream,
-) -> Result<()> {
+) -> std::result::Result<(), StorageError> {
     let uri = &req.uri;
     let metadata = get_metadata(ctx, uri).await?;
     let write_timeout = Duration::from_secs(ctx.config.write_timeout_secs);
@@ -597,7 +657,8 @@ async fn scan_streaming(
             Ok(d) => d,
             Err(e) => {
                 if tracker.is_streaming() {
-                    let err_frame = tracker.error_frame(500, format!("Scan read failed: {e}"));
+                    let err_frame =
+                        tracker.error_frame(classify_error(&e), format!("Scan read failed: {e}"));
                     let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
                 }
                 tracker.error();
@@ -613,7 +674,10 @@ async fn scan_streaming(
                 .await
                 .is_err()
             {
-                let err_frame = tracker.error_frame(500, "Write failed during scan".to_string());
+                let err_frame = tracker.error_frame(
+                    error_code::write_error(),
+                    "Write failed during scan".to_string(),
+                );
                 let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
                 tracker.error();
                 return Ok(());
@@ -628,8 +692,10 @@ async fn scan_streaming(
                     .await
                     .is_err()
                 {
-                    let err_frame =
-                        tracker.error_frame(500, "Write failed during scan".to_string());
+                    let err_frame = tracker.error_frame(
+                        error_code::write_error(),
+                        "Write failed during scan".to_string(),
+                    );
                     let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
                     tracker.error();
                     return Ok(());
@@ -666,11 +732,11 @@ async fn process_frame(
         counter: ctx.pending_requests.clone(),
     };
     if pending >= ctx.config.max_pending_requests {
-        return vec![Frame::new_json(
+        return vec![Frame::new_json_unchecked(
             MessageType::Error,
             request_id,
             &ErrorResponse {
-                code: 503,
+                error_code: error_code::server_overloaded(),
                 message: "Server overloaded, try again later".to_string(),
             },
         )];
@@ -683,11 +749,11 @@ async fn process_frame(
             let req: BatchReadRequest = match serde_json::from_slice(&frame.payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    return vec![Frame::new_json(
+                    return vec![Frame::new_json_unchecked(
                         MessageType::Error,
                         request_id,
                         &ErrorResponse {
-                            code: 400,
+                            error_code: error_code::invalid_request(),
                             message: format!("Invalid batch read request: {e}"),
                         },
                     )];
@@ -707,19 +773,18 @@ async fn process_frame(
                             .is_err()
                         {
                             tracker.error();
-                            return vec![tracker
-                                .error_frame(500, "Write failed during batch read".to_string())];
+                            return vec![tracker.error_frame(
+                                error_code::write_error(),
+                                "Write failed during batch read".to_string(),
+                            )];
                         }
                     }
                     Err(e) => {
                         tracker.error();
-                        return vec![Frame::new_json(
-                            MessageType::Error,
+                        return vec![error_response_frame(
                             request_id,
-                            &ErrorResponse {
-                                code: 500,
-                                message: format!("Batch read failed: {e}"),
-                            },
+                            classify_error(&e),
+                            format!("Batch read failed: {e}"),
                         )];
                     }
                 }
@@ -732,13 +797,10 @@ async fn process_frame(
             let req: GetMetadataRequest = match serde_json::from_slice(&frame.payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    return vec![Frame::new_json(
-                        MessageType::Error,
+                    return vec![error_response_frame(
                         request_id,
-                        &ErrorResponse {
-                            code: 400,
-                            message: format!("Invalid metadata request: {e}"),
-                        },
+                        error_code::invalid_request(),
+                        format!("Invalid metadata request: {e}"),
                     )];
                 }
             };
@@ -751,18 +813,15 @@ async fn process_frame(
                         footer_size: meta.footer_bytes.len() as u64,
                     };
                     vec![
-                        Frame::new_json(MessageType::Metadata, request_id, &meta_resp),
+                        Frame::new_json_unchecked(MessageType::Metadata, request_id, &meta_resp),
                         Frame::new_raw(MessageType::DataChunk, request_id, meta.footer_bytes),
                         Frame::done(request_id),
                     ]
                 }
-                Err(e) => vec![Frame::new_json(
-                    MessageType::Error,
+                Err(e) => vec![error_response_frame(
                     request_id,
-                    &ErrorResponse {
-                        code: 500,
-                        message: format!("Metadata fetch failed: {e}"),
-                    },
+                    classify_error(&e),
+                    format!("Metadata fetch failed: {e}"),
                 )],
             }
         }
@@ -771,25 +830,19 @@ async fn process_frame(
             let req: ScanRequest = match serde_json::from_slice(&frame.payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    return vec![Frame::new_json(
-                        MessageType::Error,
+                    return vec![error_response_frame(
                         request_id,
-                        &ErrorResponse {
-                            code: 400,
-                            message: format!("Invalid scan request: {e}"),
-                        },
+                        error_code::invalid_request(),
+                        format!("Invalid scan request: {e}"),
                     )];
                 }
             };
 
             if let Err(e) = scan_streaming(ctx, &req, request_id, stream).await {
-                return vec![Frame::new_json(
-                    MessageType::Error,
+                return vec![error_response_frame(
                     request_id,
-                    &ErrorResponse {
-                        code: 500,
-                        message: format!("Scan failed: {e}"),
-                    },
+                    classify_error(&e),
+                    format!("Scan failed: {e}"),
                 )];
             }
             vec![]
@@ -802,13 +855,16 @@ async fn process_frame(
             vec![]
         }
 
-        _ => vec![Frame::new_json(
-            MessageType::Error,
+        // Response types should never be received by the server.
+        MessageType::DataChunk
+        | MessageType::Error
+        | MessageType::Redirect
+        | MessageType::Done
+        | MessageType::Metadata
+        | MessageType::BatchScan => vec![error_response_frame(
             request_id,
-            &ErrorResponse {
-                code: 400,
-                message: format!("Unexpected message type: {:?}", frame.msg_type),
-            },
+            error_code::not_supported(),
+            format!("Unexpected message type: {:?}", frame.msg_type),
         )],
     }
 }
@@ -823,13 +879,10 @@ async fn handle_read_range(
     let req: ReadRangeRequest = match serde_json::from_slice(payload) {
         Ok(r) => r,
         Err(e) => {
-            return vec![Frame::new_json(
-                MessageType::Error,
+            return vec![error_response_frame(
                 request_id,
-                &ErrorResponse {
-                    code: 400,
-                    message: format!("Invalid read request: {e}"),
-                },
+                error_code::invalid_request(),
+                format!("Invalid read request: {e}"),
             )];
         }
     };
@@ -839,8 +892,11 @@ async fn handle_read_range(
         if let Some(owner) = ctx.membership.owner(&req.uri) {
             let parts: Vec<&str> = owner.0.split(':').collect();
             let host = parts.first().unwrap_or(&"unknown").to_string();
-            let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(51234);
-            return vec![Frame::new_json(
+            let port: u16 = parts
+                .get(1)
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(ruxio_common::settings::SETTINGS.data_port);
+            return vec![Frame::new_json_unchecked(
                 MessageType::Redirect,
                 request_id,
                 &RedirectResponse {
@@ -896,13 +952,10 @@ async fn handle_read_range(
                 Ok(_) => return vec![],
                 Err(e) => {
                     warn!("Sendfile failed for {}: {e}", req.uri);
-                    return vec![Frame::new_json(
-                        MessageType::Error,
+                    return vec![error_response_frame(
                         request_id,
-                        &ErrorResponse {
-                            code: 500,
-                            message: format!("Sendfile failed: {e}"),
-                        },
+                        error_code::sendfile_error(),
+                        format!("Sendfile failed: {e}"),
                     )];
                 }
             }
@@ -914,13 +967,10 @@ async fn handle_read_range(
                 Frame::new_raw(MessageType::DataChunk, request_id, data),
                 Frame::done(request_id),
             ],
-            Err(e) => vec![Frame::new_json(
-                MessageType::Error,
+            Err(e) => vec![error_response_frame(
                 request_id,
-                &ErrorResponse {
-                    code: 500,
-                    message: format!("Read failed: {e}"),
-                },
+                classify_error(&e),
+                format!("Read failed: {e}"),
             )],
         }
     } else {
@@ -941,13 +991,10 @@ async fn handle_read_range(
                     Ok(_) => return vec![],
                     Err(e) => {
                         warn!("Forwarded sendfile failed for {}: {e}", req.uri);
-                        return vec![Frame::new_json(
-                            MessageType::Error,
+                        return vec![error_response_frame(
                             request_id,
-                            &ErrorResponse {
-                                code: 500,
-                                message: format!("Sendfile failed: {e}"),
-                            },
+                            error_code::sendfile_error(),
+                            format!("Sendfile failed: {e}"),
                         )];
                     }
                 }
@@ -958,13 +1005,10 @@ async fn handle_read_range(
             }
         }
 
-        vec![Frame::new_json(
-            MessageType::Error,
+        vec![error_response_frame(
             request_id,
-            &ErrorResponse {
-                code: 404,
-                message: format!("Page not cached for {}", req.uri),
-            },
+            error_code::page_not_cached(),
+            format!("Page not cached for {}", req.uri),
         )]
     }
 }

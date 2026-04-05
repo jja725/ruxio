@@ -5,6 +5,9 @@ use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpListener;
 use tracing::{info, warn};
 
+/// Receive buffer for control plane HTTP requests (health, metrics).
+const CONTROL_RECV_BUFFER_BYTES: usize = 4_096;
+
 /// Read process memory usage from /proc/self/status (Linux).
 fn get_memory_usage_kb() -> (u64, u64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -26,27 +29,6 @@ fn get_memory_usage_kb() -> (u64, u64) {
         }
     }
     (rss_kb, vm_kb)
-}
-
-/// Get available disk space in bytes for a given path.
-#[allow(dead_code)]
-fn get_disk_free_bytes(path: &str) -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe {
-            let mut stat: libc::statvfs = std::mem::zeroed();
-            let c_path = std::ffi::CString::new(path).unwrap_or_default();
-            if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                return stat.f_bavail as u64 * stat.f_frsize as u64;
-            }
-        }
-        0
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        0 // Not implemented on non-Linux
-    }
 }
 
 /// Health/metrics/readiness HTTP server.
@@ -103,7 +85,7 @@ pub fn start_health_server(addr: String, ready: Arc<AtomicBool>, shutdown: Arc<A
                     let ready = ready.clone();
                     let shutdown = shutdown.clone();
                     monoio::spawn(async move {
-                        let mut buf = vec![0u8; 4096];
+                        let mut buf = vec![0u8; CONTROL_RECV_BUFFER_BYTES];
                         let (result, read_buf) = stream.read(buf).await;
                         buf = read_buf;
                         if result.unwrap_or(0) == 0 {
@@ -176,10 +158,4 @@ pub fn start_health_server(addr: String, ready: Arc<AtomicBool>, shutdown: Arc<A
             });
         })
         .expect("failed to spawn health server thread");
-}
-
-/// Check available disk space and return true if above threshold.
-#[allow(dead_code)]
-pub fn check_disk_space(cache_dir: &str, min_free_bytes: u64) -> bool {
-    get_disk_free_bytes(cache_dir) >= min_free_bytes
 }

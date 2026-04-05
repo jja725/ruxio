@@ -4,14 +4,23 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
-use crate::retry::RetryPolicy;
+use crate::error::{self, StorageError};
+use crate::retry::{GcsError, RetryPolicy};
 
 use ruxio_common::metrics::{GCS_RETRIES, GCS_TIMEOUTS};
+
+/// Minimum buffer capacity for HTTP response reads.
+const MIN_RESPONSE_BUFFER_BYTES: usize = 4_096;
+
+/// Extra headroom added to the response buffer beyond the size hint.
+const RESPONSE_BUFFER_HEADROOM: usize = 1_024;
+
+/// Read chunk size for streaming HTTP response body.
+const HTTP_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Object metadata from GCS.
 #[derive(Debug, Clone)]
@@ -87,7 +96,7 @@ impl GcsClient {
     ///
     /// Data flows: GCS → TLS decrypt → BytesMut → freeze → Bytes
     /// The returned Bytes can be sliced for page splitting without copies.
-    pub async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+    pub async fn get_range(&self, path: &str, range: Range<u64>) -> error::Result<Bytes> {
         let encoded_path = urlencoded(path);
         let range_header = format!("bytes={}-{}", range.start, range.end - 1);
         let expected_len = (range.end - range.start) as usize;
@@ -109,23 +118,29 @@ impl GcsClient {
 
         // Send request
         let (result, _) = stream.write_all(request.into_bytes()).await;
-        result.context("failed to send GCS request")?;
+        result.map_err(|e| StorageError::Connection {
+            detail: "failed to send GCS request".into(),
+            source: e,
+        })?;
 
         // Read response into BytesMut — single allocation, no intermediate copies
         let (status, body) = read_http_response(&mut stream, expected_len).await?;
 
         if !(200..300).contains(&status) {
-            // Don't return connection to pool on error
             let body_str = String::from_utf8_lossy(&body);
-            anyhow::bail!("GCS returned HTTP {status}: {body_str}");
+            return Err(StorageError::Gcs {
+                source: GcsError::from_status(status, &body_str),
+            });
         }
 
         // Validate response body length matches expected range size
         if body.len() != expected_len {
-            anyhow::bail!(
-                "GCS response body length mismatch: expected {expected_len}, got {}",
-                body.len()
-            );
+            return Err(StorageError::ResponseValidation {
+                detail: format!(
+                    "GCS response body length mismatch: expected {expected_len}, got {}",
+                    body.len()
+                ),
+            });
         }
 
         // Return connection to pool for reuse
@@ -135,7 +150,7 @@ impl GcsClient {
     }
 
     /// HEAD-style request to get object metadata (size, etag).
-    pub async fn head(&self, path: &str) -> Result<ObjectMeta> {
+    pub async fn head(&self, path: &str) -> error::Result<ObjectMeta> {
         let encoded_path = urlencoded(path);
 
         // Use the JSON metadata endpoint (not alt=media) to get size/etag
@@ -153,19 +168,24 @@ impl GcsClient {
         let mut stream = self.get_connection().await?;
 
         let (result, _) = stream.write_all(request.into_bytes()).await;
-        result.context("failed to send GCS head request")?;
+        result.map_err(|e| StorageError::Connection {
+            detail: "failed to send GCS head request".into(),
+            source: e,
+        })?;
 
         let (status, body) = read_http_response(&mut stream, 0).await?;
 
         if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
-            anyhow::bail!("GCS metadata returned HTTP {status}: {body_str}");
+            return Err(StorageError::Gcs {
+                source: GcsError::from_status(status, &body_str),
+            });
         }
 
         self.return_connection(stream);
 
         let meta: GcsObjectMeta =
-            serde_json::from_slice(&body).context("failed to parse GCS metadata response")?;
+            serde_json::from_slice(&body).map_err(|e| StorageError::Serialization { source: e })?;
 
         Ok(ObjectMeta {
             name: meta.name.unwrap_or_default(),
@@ -180,7 +200,7 @@ impl GcsClient {
     }
 
     /// List objects with a given prefix.
-    pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    pub async fn list(&self, prefix: &str) -> error::Result<Vec<ObjectMeta>> {
         let encoded_prefix = urlencoded(prefix);
 
         let request = format!(
@@ -197,13 +217,18 @@ impl GcsClient {
         let mut stream = self.get_connection().await?;
 
         let (result, _) = stream.write_all(request.into_bytes()).await;
-        result.context("failed to send GCS list request")?;
+        result.map_err(|e| StorageError::Connection {
+            detail: "failed to send GCS list request".into(),
+            source: e,
+        })?;
 
         let (status, body) = read_http_response(&mut stream, 0).await?;
 
         if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
-            anyhow::bail!("GCS list returned HTTP {status}: {body_str}");
+            return Err(StorageError::Gcs {
+                source: GcsError::from_status(status, &body_str),
+            });
         }
 
         self.return_connection(stream);
@@ -214,7 +239,7 @@ impl GcsClient {
         }
 
         let resp: ListResponse =
-            serde_json::from_slice(&body).context("failed to parse GCS list response")?;
+            serde_json::from_slice(&body).map_err(|e| StorageError::Serialization { source: e })?;
 
         Ok(resp
             .items
@@ -232,7 +257,7 @@ impl GcsClient {
     // ── Connection pool ──────────────────────────────────────────────
 
     /// Get a TLS connection, reusing from pool if available.
-    async fn get_connection(&self) -> Result<monoio_rustls::ClientTlsStream<TcpStream>> {
+    async fn get_connection(&self) -> error::Result<monoio_rustls::ClientTlsStream<TcpStream>> {
         // Try to reuse a pooled connection
         while let Some((stream, last_used)) = self.pool.borrow_mut().pop_front() {
             if last_used.elapsed() < self.idle_timeout {
@@ -256,12 +281,15 @@ impl GcsClient {
     // ── Retry wrappers ──────────────────────────────────────────────
 
     /// Fetch a byte range with retry and timeout.
+    ///
+    /// Only retries transient errors (429, 5xx, timeouts). Permanent errors
+    /// (404, 403, etc.) fail immediately without retry.
     pub async fn get_range_with_retry(
         &self,
         path: &str,
         range: Range<u64>,
         policy: &RetryPolicy,
-    ) -> Result<Bytes> {
+    ) -> error::Result<Bytes> {
         for attempt in 0..=policy.max_retries {
             if attempt > 0 {
                 monoio::time::sleep(policy.delay_for_attempt(attempt - 1)).await;
@@ -270,6 +298,9 @@ impl GcsClient {
             {
                 Ok(Ok(data)) => return Ok(data),
                 Ok(Err(e)) => {
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
                     GCS_RETRIES.inc();
                     if attempt == policy.max_retries {
                         return Err(e);
@@ -283,11 +314,9 @@ impl GcsClient {
                 Err(_) => {
                     GCS_TIMEOUTS.inc();
                     if attempt == policy.max_retries {
-                        anyhow::bail!(
-                            "GCS get_range timeout after {} retries ({}s each)",
-                            policy.max_retries,
-                            policy.timeout_secs
-                        );
+                        return Err(StorageError::Gcs {
+                            source: GcsError::Timeout(policy.timeout()),
+                        });
                     }
                     tracing::warn!(
                         "GCS get_range timeout, retry {}/{}",
@@ -297,11 +326,20 @@ impl GcsClient {
                 }
             }
         }
-        unreachable!()
+        // All retries exhausted (should not be reached due to loop logic above)
+        Err(StorageError::Gcs {
+            source: GcsError::Timeout(policy.timeout()),
+        })
     }
 
     /// HEAD request with retry and timeout.
-    pub async fn head_with_retry(&self, path: &str, policy: &RetryPolicy) -> Result<ObjectMeta> {
+    ///
+    /// Only retries transient errors. Permanent errors fail immediately.
+    pub async fn head_with_retry(
+        &self,
+        path: &str,
+        policy: &RetryPolicy,
+    ) -> error::Result<ObjectMeta> {
         for attempt in 0..=policy.max_retries {
             if attempt > 0 {
                 monoio::time::sleep(policy.delay_for_attempt(attempt - 1)).await;
@@ -309,6 +347,9 @@ impl GcsClient {
             match monoio::time::timeout(policy.timeout(), self.head(path)).await {
                 Ok(Ok(meta)) => return Ok(meta),
                 Ok(Err(e)) => {
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
                     GCS_RETRIES.inc();
                     if attempt == policy.max_retries {
                         return Err(e);
@@ -318,7 +359,9 @@ impl GcsClient {
                 Err(_) => {
                     GCS_TIMEOUTS.inc();
                     if attempt == policy.max_retries {
-                        anyhow::bail!("GCS head timeout after {} retries", policy.max_retries);
+                        return Err(StorageError::Gcs {
+                            source: GcsError::Timeout(policy.timeout()),
+                        });
                     }
                     tracing::warn!(
                         "GCS head timeout, retry {}/{}",
@@ -328,7 +371,9 @@ impl GcsClient {
                 }
             }
         }
-        unreachable!()
+        Err(StorageError::Gcs {
+            source: GcsError::Timeout(policy.timeout()),
+        })
     }
 
     fn auth_header(&self) -> String {
@@ -338,21 +383,32 @@ impl GcsClient {
         }
     }
 
-    async fn connect_tls(&self) -> Result<monoio_rustls::ClientTlsStream<TcpStream>> {
+    async fn connect_tls(&self) -> error::Result<monoio_rustls::ClientTlsStream<TcpStream>> {
         let tcp = TcpStream::connect("storage.googleapis.com:443")
             .await
-            .context("failed to connect to storage.googleapis.com:443")?;
-        let _ = tcp.set_nodelay(true);
+            .map_err(|e| StorageError::Connection {
+                detail: "failed to connect to storage.googleapis.com:443".into(),
+                source: e,
+            })?;
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!("GCS connection set_nodelay failed: {e}");
+        }
 
         let server_name = rustls::pki_types::ServerName::try_from("storage.googleapis.com")
-            .context("invalid server name")?
+            .map_err(|e| StorageError::Tls {
+                detail: format!("invalid server name: {e}"),
+            })?
             .to_owned();
 
         let connector = monoio_rustls::TlsConnector::from(self.tls_config.clone());
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .context("TLS handshake failed")?;
+        let tls_stream =
+            connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| StorageError::Connection {
+                    detail: "TLS handshake failed".into(),
+                    source: e.into(),
+                })?;
 
         Ok(tls_stream)
     }
@@ -365,16 +421,21 @@ impl GcsClient {
 async fn read_http_response<S: AsyncReadRent>(
     stream: &mut S,
     size_hint: usize,
-) -> Result<(u16, Bytes)> {
-    let mut buf = BytesMut::with_capacity(size_hint.max(4096) + 1024);
-    let mut read_buf = vec![0u8; 64 * 1024];
+) -> error::Result<(u16, Bytes)> {
+    let mut buf = BytesMut::with_capacity(
+        size_hint.max(MIN_RESPONSE_BUFFER_BYTES) + RESPONSE_BUFFER_HEADROOM,
+    );
+    let mut read_buf = vec![0u8; HTTP_READ_CHUNK_BYTES];
 
     // Read until we have the full headers
     let mut header_end = None;
     loop {
         let (result, returned_buf) = stream.read(read_buf).await;
         read_buf = returned_buf;
-        let n = result.context("failed to read GCS response")?;
+        let n = result.map_err(|e| StorageError::Connection {
+            detail: "failed to read GCS response".into(),
+            source: e,
+        })?;
         if n == 0 {
             break;
         }
@@ -389,8 +450,12 @@ async fn read_http_response<S: AsyncReadRent>(
         }
     }
 
-    let header_end = header_end.context("incomplete HTTP response headers")?;
-    let headers = std::str::from_utf8(&buf[..header_end]).context("invalid HTTP headers")?;
+    let header_end = header_end.ok_or_else(|| StorageError::HttpParse {
+        detail: "incomplete HTTP response headers".into(),
+    })?;
+    let headers = std::str::from_utf8(&buf[..header_end]).map_err(|_| StorageError::HttpParse {
+        detail: "invalid HTTP headers (not UTF-8)".into(),
+    })?;
 
     // Parse status code
     let status = parse_status_code(headers)?;
@@ -411,7 +476,10 @@ async fn read_http_response<S: AsyncReadRent>(
             while left > 0 {
                 let (result, returned_buf) = stream.read(read_buf).await;
                 read_buf = returned_buf;
-                let n = result.context("failed to read GCS response body")?;
+                let n = result.map_err(|e| StorageError::Connection {
+                    detail: "failed to read GCS response body".into(),
+                    source: e,
+                })?;
                 if n == 0 {
                     break;
                 }
@@ -425,7 +493,10 @@ async fn read_http_response<S: AsyncReadRent>(
         loop {
             let (result, returned_buf) = stream.read(read_buf).await;
             read_buf = returned_buf;
-            let n = result.context("failed to read GCS response body")?;
+            let n = result.map_err(|e| StorageError::Connection {
+                detail: "failed to read GCS response body".into(),
+                source: e,
+            })?;
             if n == 0 {
                 break;
             }
@@ -444,15 +515,21 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn parse_status_code(headers: &str) -> Result<u16> {
+fn parse_status_code(headers: &str) -> error::Result<u16> {
     // "HTTP/1.1 200 OK\r\n..."
-    let status_line = headers.lines().next().context("empty HTTP response")?;
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| StorageError::HttpParse {
+            detail: "empty HTTP response".into(),
+        })?;
     let parts: Vec<&str> = status_line.split_whitespace().collect();
-    let code: u16 = parts
-        .get(1)
-        .context("missing status code")?
-        .parse()
-        .context("invalid status code")?;
+    let code_str = parts.get(1).ok_or_else(|| StorageError::HttpParse {
+        detail: "missing status code in HTTP response".into(),
+    })?;
+    let code: u16 = code_str.parse().map_err(|_| StorageError::HttpParse {
+        detail: format!("invalid status code: {code_str}"),
+    })?;
     Ok(code)
 }
 

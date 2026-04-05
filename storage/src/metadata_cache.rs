@@ -246,8 +246,8 @@ impl MetadataCache {
                 Self::row_group_might_match(meta, rg, left)
                     || Self::row_group_might_match(meta, rg, right)
             }
-            PredicateExpr::Not(inner) => {
-                let _ = inner;
+            PredicateExpr::Not(_) => {
+                // Conservative: NOT predicates cannot be evaluated from min/max stats alone.
                 true
             }
             PredicateExpr::In { column, values } => {

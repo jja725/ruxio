@@ -31,11 +31,15 @@ impl GcsError {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() > max {
-        &s[..max]
-    } else {
-        s
+    if s.len() <= max {
+        return s;
     }
+    // Find the largest char boundary at or before `max` to avoid
+    // panicking on multi-byte UTF-8 sequences.
+    s.get(..max).unwrap_or_else(|| {
+        let end = s.floor_char_boundary(max);
+        &s[..end]
+    })
 }
 
 /// Retry policy with exponential backoff.
@@ -56,7 +60,7 @@ impl Default for RetryPolicy {
         Self {
             max_retries: 5,
             base_delay_ms: 100,
-            max_delay_ms: 5000,
+            max_delay_ms: 5_000,
             timeout_secs: 30,
         }
     }

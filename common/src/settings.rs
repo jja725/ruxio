@@ -9,8 +9,22 @@ use serde::Deserialize;
 use local_ip_address::local_ip;
 use log::info;
 
+/// Default port for control plane (health, metrics, readiness).
+const DEFAULT_CONTROL_PORT: u16 = 51_235;
+
+/// Default port for binary data plane (frame protocol).
+const DEFAULT_DATA_PORT: u16 = 51_234;
+
+/// Default port for HTTP/1.1 data plane (zero-copy reads).
+const DEFAULT_HTTP_PORT: u16 = 51_236;
+
+/// Default number of worker threads.
+const DEFAULT_THREADS: usize = 16;
+
 lazy_static! {
-    pub static ref SETTINGS: Settings = Settings::new().unwrap();
+    pub static ref SETTINGS: Settings = Settings::new().expect(
+        "Failed to load ruxio configuration. Check RUXIO_CONFIG env var and config file path."
+    );
 }
 
 /// Top-level configuration.
@@ -132,7 +146,7 @@ impl Default for GcsSettings {
             credentials_path: None,
             max_retries: 5,
             retry_base_delay_ms: 100,
-            retry_max_delay_ms: 5000,
+            retry_max_delay_ms: 5_000,
             request_timeout_secs: 30,
         }
     }
@@ -148,7 +162,7 @@ impl Default for ServerSettings {
             max_pending_requests: 1_000,
             response_chunk_bytes: 4 * 1024 * 1024, // 4MB chunks
             sendfile_timeout_secs: 300,
-            so_backlog: 1024,
+            so_backlog: 1_024,
             so_reuseaddr: true,
             tcp_fastopen: true,
             tcp_fastopen_qlen: 256,
@@ -174,16 +188,23 @@ impl From<Config> for Settings {
         let log_level = config
             .get::<String>("log_level")
             .unwrap_or_else(|_| "info".into());
-        let hostname = config
-            .get::<String>("hostname")
-            .unwrap_or_else(|_| hostname::get().unwrap().into_string().unwrap());
-        let local_ip = config
-            .get::<String>("local_ip")
-            .unwrap_or_else(|_| local_ip().unwrap().to_string());
-        let control_port = config.get::<u16>("control_port").unwrap_or(51235);
-        let data_port = config.get::<u16>("data_port").unwrap_or(51234);
-        let http_port = config.get::<u16>("http_port").unwrap_or(51236);
-        let threads = config.get::<usize>("threads").unwrap_or(16);
+        let hostname = config.get::<String>("hostname").unwrap_or_else(|_| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+        let local_ip = config.get::<String>("local_ip").unwrap_or_else(|_| {
+            local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| "127.0.0.1".to_string())
+        });
+        let control_port = config
+            .get::<u16>("control_port")
+            .unwrap_or(DEFAULT_CONTROL_PORT);
+        let data_port = config.get::<u16>("data_port").unwrap_or(DEFAULT_DATA_PORT);
+        let http_port = config.get::<u16>("http_port").unwrap_or(DEFAULT_HTTP_PORT);
+        let threads = config.get::<usize>("threads").unwrap_or(DEFAULT_THREADS);
         let service_discovery_type = config
             .get_string("service_discovery_type")
             .unwrap_or_else(|_| "static".into());

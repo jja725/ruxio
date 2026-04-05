@@ -188,12 +188,12 @@ pub async fn forward_lookup(
     let channel = &channel_matrix[from_thread][to_thread];
 
     // Push request (spin-yield if queue is full — shouldn't happen with 256 slots)
-    let mut req = Some(ForwardRequest { key });
+    let mut req = ForwardRequest { key };
     loop {
-        match channel.requests.try_push(req.take().unwrap()) {
+        match channel.requests.try_push(req) {
             Ok(()) => break,
             Err(returned) => {
-                req = Some(returned);
+                req = returned;
                 monoio::time::sleep(Duration::from_micros(1)).await;
             }
         }

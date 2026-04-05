@@ -205,11 +205,6 @@ impl ClockProState {
         None
     }
 
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -307,11 +302,6 @@ impl LruState {
 
     fn is_empty(&self) -> bool {
         self.head == NONE
-    }
-
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        self.pos.len()
     }
 
     // ── linked list operations ───────────────────────────────────────

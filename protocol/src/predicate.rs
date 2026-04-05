@@ -96,7 +96,10 @@ pub enum PredicateExpr {
 impl PredicateExpr {
     /// Compute a stable hash of this predicate for use as part of a cache key.
     pub fn cache_key_hash(&self) -> u64 {
-        let serialized = serde_json::to_string(self).unwrap_or_default();
+        // PredicateExpr contains only String, i64, f64, bool, Vec — all serialize
+        // infallibly. If this ever fails, it's a bug in the type definition.
+        let serialized =
+            serde_json::to_string(self).expect("PredicateExpr serialization should never fail");
 
         Xxh3DefaultBuilder.hash_one(&serialized)
     }

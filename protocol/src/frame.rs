@@ -79,8 +79,6 @@ const BODY_HEADER_SIZE: usize = 5;
 pub enum FrameError {
     #[error("unknown message type: 0x{0:02x}")]
     UnknownMessageType(u8),
-    #[error("incomplete frame: need {needed} bytes, have {have}")]
-    Incomplete { needed: usize, have: usize },
     #[error("frame too large: {size} bytes (max {max})")]
     TooLarge { size: usize, max: usize },
 }
@@ -90,17 +88,32 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 impl Frame {
     /// Create a new frame with JSON-serialized payload.
+    ///
+    /// Returns an error if serialization fails.
     pub fn new_json<T: serde::Serialize>(
         msg_type: MessageType,
         request_id: u32,
         value: &T,
-    ) -> Self {
-        let payload = serde_json::to_vec(value).unwrap();
-        Frame {
+    ) -> Result<Self, serde_json::Error> {
+        let payload = serde_json::to_vec(value)?;
+        Ok(Frame {
             msg_type,
             request_id,
             payload: Bytes::from(payload),
-        }
+        })
+    }
+
+    /// Create a JSON frame, panicking if serialization fails.
+    ///
+    /// Use only for types guaranteed to serialize successfully
+    /// (e.g., structs containing only String, u32, u16, bool fields).
+    pub fn new_json_unchecked<T: serde::Serialize>(
+        msg_type: MessageType,
+        request_id: u32,
+        value: &T,
+    ) -> Self {
+        Self::new_json(msg_type, request_id, value)
+            .expect("serialization of a simple response struct should never fail")
     }
 
     /// Create a new frame with raw bytes payload (for DataChunk).
@@ -133,6 +146,10 @@ impl Frame {
     /// Encode this frame into wire format bytes.
     pub fn encode(&self) -> Bytes {
         let body_len = BODY_HEADER_SIZE + self.payload.len();
+        debug_assert!(
+            body_len <= u32::MAX as usize,
+            "frame body exceeds u32::MAX: {body_len}"
+        );
         let mut buf = BytesMut::with_capacity(4 + body_len);
         buf.put_u32(body_len as u32);
         buf.put_u8(self.msg_type as u8);
@@ -144,6 +161,10 @@ impl Frame {
     /// Encode just the 9-byte header (for scatter writes where payload is sent separately).
     pub fn encode_header(&self) -> [u8; FRAME_HEADER_SIZE] {
         let body_len = BODY_HEADER_SIZE + self.payload.len();
+        debug_assert!(
+            body_len <= u32::MAX as usize,
+            "frame body exceeds u32::MAX: {body_len}"
+        );
         let mut header = [0u8; FRAME_HEADER_SIZE];
         header[0..4].copy_from_slice(&(body_len as u32).to_be_bytes());
         header[4] = self.msg_type as u8;
@@ -288,7 +309,7 @@ mod tests {
             offset: 4096,
             length: 4 * 1024 * 1024,
         };
-        let frame = Frame::new_json(MessageType::ReadRange, 42, &req);
+        let frame = Frame::new_json(MessageType::ReadRange, 42, &req).unwrap();
         let encoded = frame.encode();
 
         let (decoded, consumed) = Frame::decode(&encoded).unwrap().unwrap();
@@ -305,7 +326,7 @@ mod tests {
             offset: 0,
             length: 1024,
         };
-        let frame = Frame::new_json(MessageType::ReadRange, 42, &req);
+        let frame = Frame::new_json(MessageType::ReadRange, 42, &req).unwrap();
         let encoded = frame.encode();
 
         let mut reader = FrameReader::new();

@@ -5,6 +5,9 @@
 
 use std::rc::Rc;
 
+/// Initial receive buffer for HTTP request headers.
+const HTTP_RECV_BUFFER_BYTES: usize = 8_192;
+
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
@@ -162,8 +165,10 @@ async fn write_error(
 
 pub async fn serve_http_connection(stream: TcpStream, ctx: Rc<ThreadContext>) {
     let mut stream = stream;
-    let _ = stream.set_nodelay(true);
-    let mut buf = vec![0u8; 8192];
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("set_nodelay failed: {e}");
+    }
+    let mut buf = vec![0u8; HTTP_RECV_BUFFER_BYTES];
     let mut filled = 0usize;
     let header_timeout = std::time::Duration::from_secs(10);
 
@@ -389,6 +394,8 @@ async fn handle_read(stream: &mut TcpStream, req: &HttpRequest, ctx: &Rc<ThreadC
 fn set_tcp_cork(stream: &TcpStream, cork: bool) {
     use std::os::unix::io::AsRawFd;
     let val: libc::c_int = if cork { 1 } else { 0 };
+    // SAFETY: stream fd is valid (from monoio TcpStream), val is a stack-allocated
+    // c_int with correct size. setsockopt only reads from the pointer.
     unsafe {
         libc::setsockopt(
             stream.as_raw_fd(),
