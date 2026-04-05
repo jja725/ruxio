@@ -26,16 +26,53 @@ All tunables live in `common/src/settings.rs` as TOML + env vars. No CLI args fo
 
 - **Config file**: `ruxio_config.toml` (or `RUXIO_CONFIG` env var, or `--config` CLI arg).
 - **Env overrides**: `RUXIO_` prefix, `__` separator (e.g., `RUXIO_CACHE__PAGE_SIZE_BYTES`).
-- Eagerly validate config fields in constructors, not lazily at use sites.
 
-## Coding Style
+## Architecture
+
+- **monoio thread-per-core**: no `Send`/`Sync` for most types. Each core owns its cache partition. `Rc<RefCell<>>` intra-thread, `Arc<AtomicBool/AtomicU32>` cross-thread.
+- **No tokio on hot path**: all data plane I/O through monoio's io_uring. Tokio only in etcd background thread (`cluster/src/etcd.rs`), communicating via `std::sync::mpsc`.
+- **Page cache**: CLOCK-Pro + TinyLFU + Bloom filters. Internal to `PageCache` — callers use the `Cache` trait.
+- **Predicate evaluation**: conservative on Parquet row group stats (min/max). Unknown types or missing stats assume a match.
+- **GCS client**: HTTP/1.1 keep-alive pool, exponential backoff retry for transient errors (429, 5xx).
+- **Production hardening**: connection limits, idle timeout, flow control (64MB in-flight), corruption detection, cache restore, readiness probe, graceful shutdown.
+
+## Error Handling (Project-Specific)
+
+- Use `snafu` for all non-test error types. Use `anyhow` only in tests. `thiserror` is not used.
+- **Every error variant must carry `#[snafu(implicit)] location: Location`** for automatic file/line tracking. Use `#[snafu(visibility(pub))]` to generate public context selectors. See `storage/src/error.rs` for the canonical example.
+- **Use snafu context selectors** instead of direct construction: `.context(ConnectionSnafu { detail: "..." })?` for Result chains, `PageAssemblySnafu { detail }.fail()` for returning errors, `GcsSnafu.into_error(source)` for wrapping sources.
+
+## Logging (Project-Specific)
+
+- Use `tracing` for new code; existing `log`/`fern` in common is acceptable.
+  - `debug!` — routine ops (cache hits, connection recycling).
+  - `info!` — state changes (server started, member joined ring).
+  - `warn!` — unexpected conditions that are handled (retry triggered).
+  - `error!` — unrecoverable failures requiring operator attention.
+
+## Testing (Project-Specific)
+
+- Use `rstest` for parameterized tests with `#[case::{name}(...)]`.
+- Test cache algorithms (eviction, admission, Bloom filters) with deterministic inputs.
+- Hash ring tests: verify distribution uniformity and minimal disruption on node changes.
+- Frame codec tests: round-trip encoding, partial reads, error cases.
+
+## Commit Scopes (Project-Specific)
+
+- **Scopes**: `cache`, `gcs`, `protocol`, `cluster`, `server`, `bench`, `config`.
+
+---
+
+## General Rust Conventions
+
+The following conventions apply broadly to Rust projects.
 
 ### Naming
-- **No abbreviations** except established domain terms (`rpc`, `gcs`, `ttl`, `io`, `id`). `position_count` not `pos_cnt`.
+- **No abbreviations** except established domain terms (`rpc`, `ttl`, `io`, `id`). `position_count` not `pos_cnt`.
 - **Avoid generic `get_` prefixes** — use `find_` (lookup, may fail), `fetch_` (remote/expensive), `compute_` (derived), `load_` (from disk). Reserve `get_` for trivial field accessors.
-- **Avoid generic module names** like `utils.rs`, `helpers.rs` — name after the concept (e.g., `retry.rs`, `ring.rs`).
+- **Avoid generic module names** like `utils.rs`, `helpers.rs` — name after the concept.
 - Prefix booleans with `is_`/`has_`; default to `false`. Use `disable_*` instead of `enable_*` when the feature defaults to on.
-- Use **named constants** for magic numbers: `const PAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;` not bare `4096`.
+- Use **named constants** for magic numbers. No bare `4096` or `"default"` in logic.
 - Use **type aliases** for domain concepts at API boundaries: `type PageId = u64;`.
 
 ### Organization
@@ -45,81 +82,45 @@ All tunables live in `common/src/settings.rs` as TOML + env vars. No CLI args fo
 
 ### Control Flow
 - When advancing multiple iterators in lockstep, advance *all* before any `continue` or conditional branch — an early `continue` that skips a `.next()` causes silent misalignment.
-- **Avoid iterator chains in hot loops** or performance-sensitive sections; use explicit `for` loops for clarity and control.
+- **Avoid iterator chains in hot loops** — use explicit `for` loops for clarity and control in performance-sensitive sections.
 - **No wildcard `_ =>` on owned enums.** Use exhaustive patterns so the compiler catches missing variants. Use `_ =>` only for external enums you don't control.
 
 ### API Design
-- **Eagerly validate in constructors.** Assert preconditions in `new()` and builders — not deep in the call stack. Fail fast at construction.
-- **Never expose internals for testing.** Design testable interfaces; don't add `pub` or `#[cfg(test)]` accessors to reach into private state.
-- Use stable, versioned serialization formats for persistent data. Never assume format stability across versions without explicit versioning.
+- **Eagerly validate in constructors.** Fail fast at construction, not deep in the call stack.
+- **Never expose internals for testing.** Design testable interfaces; don't add `pub` or `#[cfg(test)]` accessors for private state.
+- Use stable, versioned serialization formats for persistent data.
 - **Gate risky new features behind config flags** until proven stable in production.
 - Replace mutually exclusive boolean flags with a single enum/mode parameter.
 
-### Logging
-- Use `tracing` for new code; existing `log`/`fern` in common is acceptable.
-  - `debug!` — routine ops (cache hits, connection recycling).
-  - `info!` — state changes (server started, member joined ring).
-  - `warn!` — unexpected conditions that are handled (retry triggered).
-  - `error!` — unrecoverable failures requiring operator attention.
-
-### Memory
-- Prefer `RoaringBitmap` over `HashSet<u32>` for large sparse sets, `SmallVec` for small-N collections, `Cow<str>` for mostly-borrowed strings. Avoid collecting entire streams into `Vec` when you can process iteratively.
-- **Every `unsafe` block must have a `// SAFETY:` comment.** No exceptions.
-
-## Error Handling
-
-- Use `snafu` for all non-test error types. Use `anyhow` only in tests. `thiserror` is not used.
-- **Every error variant must carry `#[snafu(implicit)] location: Location`** for automatic file/line tracking. Use `#[snafu(visibility(pub))]` to generate public context selectors. See `storage/src/error.rs` for the canonical example.
-- **Use snafu context selectors** instead of direct construction: `.context(ConnectionSnafu { detail: "..." })?` for Result chains, `PageAssemblySnafu { detail }.fail()` for returning errors, `GcsSnafu.into_error(source)` for wrapping sources.
-- **Match error variants to root causes** with specific variants for monitoring: `StorageError::ConnectionTimeout` vs `StorageError::DiskFull`, not a generic `StorageError::Io`.
-- Include full context in error messages: `"Page offset {} exceeds file size {}"` not `"Invalid offset"`.
-- **No silent `let _ =` on `Result`** — log at `debug` or `warn` level, or increment a metric.
+### Error Handling
+- **Match error variants to root causes** with specific variants for monitoring — not a generic catch-all.
+- Include full context in error messages: values, sizes, types. `"Page offset {} exceeds file size {}"` not `"Invalid offset"`.
+- **No silent `let _ =` on `Result`** — log at `debug`/`warn` or increment a metric.
 - Use `checked_add`/`checked_mul` for counters and offsets; return errors on overflow.
 - Prefer `debug_assert!` for internal invariants; reserve `assert!` for data corruption prevention.
 - Log warnings for best-effort/cleanup failures rather than silently swallowing.
-- **Don't log a warning then immediately return the same error.** The error propagation is sufficient — log only for conditions that are *handled* and won't propagate.
+- **Don't log a warning then immediately return the same error.** Log only for conditions that are *handled* and won't propagate.
 - **Don't silently work around infrastructure bugs.** Report root causes and fix properly.
 
-## Architecture
+### Memory & Safety
+- Prefer memory-efficient data structures for large collections (`RoaringBitmap` over `HashSet<u32>`, `SmallVec` for small-N, `Cow<str>` for mostly-borrowed). Avoid collecting streams into `Vec` when you can process iteratively.
+- **Every `unsafe` block must have a `// SAFETY:` comment.** No exceptions.
+- **No unbounded data structures** in performance-sensitive paths.
 
-- **monoio thread-per-core**: no `Send`/`Sync` for most types. Each core owns its cache partition. `Rc<RefCell<>>` intra-thread, `Arc<AtomicBool/AtomicU32>` cross-thread.
-- **No tokio on hot path**: all data plane I/O through monoio's io_uring. Tokio only in etcd background thread (`cluster/src/etcd.rs`), communicating via `std::sync::mpsc`.
-- **No unbounded data structures** in performance-sensitive paths — always enforce capacity limits.
-- **Page cache**: CLOCK-Pro + TinyLFU + Bloom filters. Internal to `PageCache` — callers use the `Cache` trait.
-- **Predicate evaluation**: conservative on Parquet row group stats (min/max). Unknown types or missing stats assume a match.
-- **GCS client**: HTTP/1.1 keep-alive pool, exponential backoff retry for transient errors (429, 5xx).
-- **Production hardening**: connection limits, idle timeout, flow control (64MB in-flight), corruption detection, cache restore, readiness probe, graceful shutdown.
-
-## Dependencies
-
-- Keep `Cargo.lock` changes intentional; revert unrelated dependency bumps. Pin broken deps with a comment linking the upstream issue.
-
-## Testing
-
+### Testing
 - **All bugfixes and features must have tests. Do not merge without tests.**
-- **Write a failing test before fixing a bug** — verify it captures the failure, then fix.
-- Use `rstest` for parameterized tests with `#[case::{name}(...)]`.
+- **Write a failing test before fixing a bug.**
 - **Tests must be deterministic** — no random seeds without fixed values, no `std::thread::sleep` for synchronization.
 - **No mocking libraries.** Write manual test doubles. If a type is hard to test without mocks, refactor the interface.
 - Assert on both error type and message content — don't just check `is_err()`.
 - **If a test fails, assume the code is wrong.** Only update expectations after verifying correctness.
-- **`#[ignore]` tests must link a tracking issue** — no bare `#[ignore]` without `// TODO(#123)`.
-- Test cache algorithms (eviction, admission, Bloom filters) with deterministic inputs.
-- Hash ring tests: verify distribution uniformity and minimal disruption on node changes.
-- Frame codec tests: round-trip encoding, partial reads, error cases.
+- **`#[ignore]` tests must link a tracking issue.**
 
-## Commits & Pull Requests
-
-### Commits
-- **Format**: `type(scope): Description` — imperative, capital letter, no trailing period, under 72 chars.
+### Commits & PRs
+- **Commit format**: `type(scope): Description` — imperative, under 72 chars. Body explains *what* and *why*.
 - **Types**: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `build`, `chore`.
-- **Scopes**: `cache`, `gcs`, `protocol`, `cluster`, `server`, `bench`, `config`.
-- **Body**: explain *what* and *why*, not *how*. Assume someone may need to revert during an emergency.
-
-### Pull Requests
-- One logical change per PR — no drive-by refactors or cosmetic changes.
-- Every commit must compile and pass tests independently.
-- **Discuss large designs before implementing** — if a change touches 3+ modules or adds a new abstraction, write up the approach first.
+- One logical change per PR. Every commit must compile and pass tests.
+- **Discuss large designs before implementing** — write up the approach first.
 - Include before/after benchmark numbers for performance changes.
 - **All new features and config options need user-facing documentation.**
 
