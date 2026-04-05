@@ -77,7 +77,7 @@ The following conventions apply broadly to Rust projects.
 ### Error Handling
 - Use `snafu` for all non-test error types. Use `anyhow` only in tests.
 - **Every error variant must carry `#[snafu(implicit)] location: Location`** for automatic file/line tracking (Rust's equivalent of Java stack traces). Use `#[snafu(visibility(pub))]` to generate public context selectors.
-- **Use snafu context selectors** instead of direct construction: `.context(ConnectionSnafu { detail: "..." })?` for Result chains, `PageAssemblySnafu { detail }.fail()` for returning errors, `GcsSnafu.into_error(source)` for wrapping sources.
+- **Use snafu context selectors** instead of direct error construction: `.context(SelectorSnafu { field })?` for Result chains, `SelectorSnafu { field }.fail()` for early returns, `SelectorSnafu.into_error(source)` for wrapping sources.
 - **Match error variants to root causes** with specific variants for monitoring — not a generic catch-all.
 - Include full context in error messages: values, sizes, types. `"Page offset {} exceeds file size {}"` not `"Invalid offset"`.
 - **No silent `let _ =` on `Result`** — log at `debug`/`warn` or increment a metric.
