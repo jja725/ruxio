@@ -71,12 +71,10 @@ pub fn invalid_request() -> ErrorCode {
     error_code!(0x0000_0001, "INVALID_REQUEST", ErrorType::UserError, false)
 }
 
-/// Requested URI/resource not found.
 pub fn not_found() -> ErrorCode {
     error_code!(0x0000_0002, "NOT_FOUND", ErrorType::UserError, false)
 }
 
-/// Permission denied (invalid/missing auth token).
 pub fn permission_denied() -> ErrorCode {
     error_code!(
         0x0000_0003,
@@ -86,14 +84,12 @@ pub fn permission_denied() -> ErrorCode {
     )
 }
 
-/// Unsupported message type or protocol version.
 pub fn not_supported() -> ErrorCode {
     error_code!(0x0000_0004, "NOT_SUPPORTED", ErrorType::UserError, false)
 }
 
 // ── Internal errors (0x0001_xxxx) ───────────────────────────────────
 
-/// Generic internal server error.
 pub fn generic_internal_error() -> ErrorCode {
     error_code!(
         0x0001_0000,
@@ -103,17 +99,14 @@ pub fn generic_internal_error() -> ErrorCode {
     )
 }
 
-/// Page data corruption detected (size mismatch, checksum failure).
 pub fn corrupt_page() -> ErrorCode {
     error_code!(0x0001_0001, "CORRUPT_PAGE", ErrorType::InternalError, false)
 }
 
-/// Disk I/O error during page read/write.
 pub fn disk_io_error() -> ErrorCode {
     error_code!(0x0001_0002, "DISK_IO_ERROR", ErrorType::InternalError, true)
 }
 
-/// Page not found in local cache (expected to be present).
 pub fn page_not_cached() -> ErrorCode {
     error_code!(
         0x0001_0003,
@@ -123,7 +116,6 @@ pub fn page_not_cached() -> ErrorCode {
     )
 }
 
-/// Metadata (Parquet footer) parse failure.
 pub fn metadata_parse_error() -> ErrorCode {
     error_code!(
         0x0001_0004,
@@ -133,7 +125,7 @@ pub fn metadata_parse_error() -> ErrorCode {
     )
 }
 
-/// Server is shutting down gracefully.
+/// Retryable — client should reconnect to another node.
 pub fn server_shutting_down() -> ErrorCode {
     error_code!(
         0x0001_0005,
@@ -143,7 +135,6 @@ pub fn server_shutting_down() -> ErrorCode {
     )
 }
 
-/// Sendfile / zero-copy transfer failed.
 pub fn sendfile_error() -> ErrorCode {
     error_code!(
         0x0001_0006,
@@ -153,19 +144,16 @@ pub fn sendfile_error() -> ErrorCode {
     )
 }
 
-/// Write to client failed (network, timeout).
 pub fn write_error() -> ErrorCode {
     error_code!(0x0001_0007, "WRITE_ERROR", ErrorType::InternalError, true)
 }
 
-/// Frame codec or serialization error.
 pub fn codec_error() -> ErrorCode {
     error_code!(0x0001_0008, "CODEC_ERROR", ErrorType::InternalError, false)
 }
 
 // ── Resource exhaustion (0x0002_xxxx) ───────────────────────────────
 
-/// Server overloaded — too many pending requests.
 pub fn server_overloaded() -> ErrorCode {
     error_code!(
         0x0002_0001,
@@ -175,7 +163,6 @@ pub fn server_overloaded() -> ErrorCode {
     )
 }
 
-/// Connection limit reached.
 pub fn connection_limit() -> ErrorCode {
     error_code!(
         0x0002_0002,
@@ -187,7 +174,7 @@ pub fn connection_limit() -> ErrorCode {
 
 // ── External errors (0x0003_xxxx) ───────────────────────────────────
 
-/// GCS transient error (429 Too Many Requests, 5xx, network timeout).
+/// HTTP 429, 5xx, or network timeout — retryable.
 pub fn gcs_transient_error() -> ErrorCode {
     error_code!(
         0x0003_0001,
@@ -197,7 +184,7 @@ pub fn gcs_transient_error() -> ErrorCode {
     )
 }
 
-/// GCS permanent error (404, 403, 400).
+/// HTTP 4xx (except 429) — not retryable.
 pub fn gcs_permanent_error() -> ErrorCode {
     error_code!(
         0x0003_0002,
@@ -207,12 +194,10 @@ pub fn gcs_permanent_error() -> ErrorCode {
     )
 }
 
-/// GCS request timeout after all retries exhausted.
 pub fn gcs_timeout() -> ErrorCode {
     error_code!(0x0003_0003, "GCS_TIMEOUT", ErrorType::External, true)
 }
 
-/// GCS response validation failed (body length mismatch).
 pub fn gcs_response_invalid() -> ErrorCode {
     error_code!(
         0x0003_0004,
@@ -222,12 +207,10 @@ pub fn gcs_response_invalid() -> ErrorCode {
     )
 }
 
-/// TLS/connection failure to external service.
 pub fn connection_error() -> ErrorCode {
     error_code!(0x0003_0005, "CONNECTION_ERROR", ErrorType::External, true)
 }
 
-/// etcd membership error.
 pub fn membership_error() -> ErrorCode {
     error_code!(0x0003_0006, "MEMBERSHIP_ERROR", ErrorType::External, true)
 }

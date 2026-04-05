@@ -99,21 +99,9 @@ pub enum StorageError {
 
 impl StorageError {
     /// Whether this error is transient and the operation should be retried.
-    ///
-    /// GCS transient errors (429, 5xx, timeouts) and connection/disk I/O
-    /// errors are retryable; all other categories are permanent.
+    /// Derived from the error code's retryability flag to avoid redundant state.
     pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::Gcs { source, .. } => source.is_retryable(),
-            Self::DiskIo { .. } => true,
-            Self::Connection { .. } => true,
-            Self::PageAssembly { .. }
-            | Self::HttpParse { .. }
-            | Self::Serialization { .. }
-            | Self::MetadataParse { .. }
-            | Self::Tls { .. }
-            | Self::ResponseValidation { .. } => false,
-        }
+        self.to_error_code().retriable
     }
 
     /// Map this storage error to a wire protocol error code.
