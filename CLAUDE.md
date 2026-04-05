@@ -42,14 +42,6 @@ All tunables live in `common/src/settings.rs` as TOML + env vars. No CLI args fo
 - **Every error variant must carry `#[snafu(implicit)] location: Location`** for automatic file/line tracking. Use `#[snafu(visibility(pub))]` to generate public context selectors. See `storage/src/error.rs` for the canonical example.
 - **Use snafu context selectors** instead of direct construction: `.context(ConnectionSnafu { detail: "..." })?` for Result chains, `PageAssemblySnafu { detail }.fail()` for returning errors, `GcsSnafu.into_error(source)` for wrapping sources.
 
-## Logging (Project-Specific)
-
-- Use `tracing` for all logging.
-  - `debug!` — routine ops (cache hits, connection recycling).
-  - `info!` — state changes (server started, member joined ring).
-  - `warn!` — unexpected conditions that are handled (retry triggered).
-  - `error!` — unrecoverable failures requiring operator attention.
-
 ## Testing (Project-Specific)
 
 - Use `rstest` for parameterized tests with `#[case::{name}(...)]`.
