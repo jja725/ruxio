@@ -8,7 +8,12 @@ use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
-use crate::error::{self, StorageError};
+use snafu::{IntoError, ResultExt};
+
+use crate::error::{
+    self, ConnectionSnafu, GcsSnafu, HttpParseSnafu, ResponseValidationSnafu, SerializationSnafu,
+    TlsSnafu,
+};
 use crate::retry::{GcsError, RetryPolicy};
 
 use ruxio_common::metrics::{GCS_RETRIES, GCS_TIMEOUTS};
@@ -118,9 +123,8 @@ impl GcsClient {
 
         // Send request
         let (result, _) = stream.write_all(request.into_bytes()).await;
-        result.map_err(|e| StorageError::Connection {
-            detail: "failed to send GCS request".into(),
-            source: e,
+        result.context(ConnectionSnafu {
+            detail: "failed to send GCS request",
         })?;
 
         // Read response into BytesMut — single allocation, no intermediate copies
@@ -128,19 +132,18 @@ impl GcsClient {
 
         if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
-            return Err(StorageError::Gcs {
-                source: GcsError::from_status(status, &body_str),
-            });
+            return Err(GcsSnafu.into_error(GcsError::from_status(status, &body_str)));
         }
 
         // Validate response body length matches expected range size
         if body.len() != expected_len {
-            return Err(StorageError::ResponseValidation {
+            return Err(ResponseValidationSnafu {
                 detail: format!(
                     "GCS response body length mismatch: expected {expected_len}, got {}",
                     body.len()
                 ),
-            });
+            }
+            .build());
         }
 
         // Return connection to pool for reuse
@@ -168,24 +171,20 @@ impl GcsClient {
         let mut stream = self.get_connection().await?;
 
         let (result, _) = stream.write_all(request.into_bytes()).await;
-        result.map_err(|e| StorageError::Connection {
-            detail: "failed to send GCS head request".into(),
-            source: e,
+        result.context(ConnectionSnafu {
+            detail: "failed to send GCS head request",
         })?;
 
         let (status, body) = read_http_response(&mut stream, 0).await?;
 
         if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
-            return Err(StorageError::Gcs {
-                source: GcsError::from_status(status, &body_str),
-            });
+            return Err(GcsSnafu.into_error(GcsError::from_status(status, &body_str)));
         }
 
         self.return_connection(stream);
 
-        let meta: GcsObjectMeta =
-            serde_json::from_slice(&body).map_err(|e| StorageError::Serialization { source: e })?;
+        let meta: GcsObjectMeta = serde_json::from_slice(&body).context(SerializationSnafu)?;
 
         Ok(ObjectMeta {
             name: meta.name.unwrap_or_default(),
@@ -217,18 +216,15 @@ impl GcsClient {
         let mut stream = self.get_connection().await?;
 
         let (result, _) = stream.write_all(request.into_bytes()).await;
-        result.map_err(|e| StorageError::Connection {
-            detail: "failed to send GCS list request".into(),
-            source: e,
+        result.context(ConnectionSnafu {
+            detail: "failed to send GCS list request",
         })?;
 
         let (status, body) = read_http_response(&mut stream, 0).await?;
 
         if !(200..300).contains(&status) {
             let body_str = String::from_utf8_lossy(&body);
-            return Err(StorageError::Gcs {
-                source: GcsError::from_status(status, &body_str),
-            });
+            return Err(GcsSnafu.into_error(GcsError::from_status(status, &body_str)));
         }
 
         self.return_connection(stream);
@@ -238,8 +234,7 @@ impl GcsClient {
             items: Option<Vec<GcsObjectMeta>>,
         }
 
-        let resp: ListResponse =
-            serde_json::from_slice(&body).map_err(|e| StorageError::Serialization { source: e })?;
+        let resp: ListResponse = serde_json::from_slice(&body).context(SerializationSnafu)?;
 
         Ok(resp
             .items
@@ -314,11 +309,9 @@ impl GcsClient {
                 Err(_) => {
                     GCS_TIMEOUTS.inc();
                     if attempt == policy.max_retries {
-                        return Err(StorageError::Gcs {
-                            source: GcsError::Timeout {
-                                duration: policy.timeout(),
-                            },
-                        });
+                        return Err(GcsSnafu.into_error(GcsError::Timeout {
+                            duration: policy.timeout(),
+                        }));
                     }
                     tracing::warn!(
                         "GCS get_range timeout, retry {}/{}",
@@ -329,11 +322,9 @@ impl GcsClient {
             }
         }
         // All retries exhausted (should not be reached due to loop logic above)
-        Err(StorageError::Gcs {
-            source: GcsError::Timeout {
-                duration: policy.timeout(),
-            },
-        })
+        Err(GcsSnafu.into_error(GcsError::Timeout {
+            duration: policy.timeout(),
+        }))
     }
 
     /// HEAD request with retry and timeout.
@@ -363,11 +354,9 @@ impl GcsClient {
                 Err(_) => {
                     GCS_TIMEOUTS.inc();
                     if attempt == policy.max_retries {
-                        return Err(StorageError::Gcs {
-                            source: GcsError::Timeout {
-                                duration: policy.timeout(),
-                            },
-                        });
+                        return Err(GcsSnafu.into_error(GcsError::Timeout {
+                            duration: policy.timeout(),
+                        }));
                     }
                     tracing::warn!(
                         "GCS head timeout, retry {}/{}",
@@ -377,11 +366,9 @@ impl GcsClient {
                 }
             }
         }
-        Err(StorageError::Gcs {
-            source: GcsError::Timeout {
-                duration: policy.timeout(),
-            },
-        })
+        Err(GcsSnafu.into_error(GcsError::Timeout {
+            duration: policy.timeout(),
+        }))
     }
 
     fn auth_header(&self) -> String {
@@ -394,29 +381,29 @@ impl GcsClient {
     async fn connect_tls(&self) -> error::Result<monoio_rustls::ClientTlsStream<TcpStream>> {
         let tcp = TcpStream::connect("storage.googleapis.com:443")
             .await
-            .map_err(|e| StorageError::Connection {
-                detail: "failed to connect to storage.googleapis.com:443".into(),
-                source: e,
+            .context(ConnectionSnafu {
+                detail: "failed to connect to storage.googleapis.com:443",
             })?;
         if let Err(e) = tcp.set_nodelay(true) {
             tracing::debug!("GCS connection set_nodelay failed: {e}");
         }
 
         let server_name = rustls::pki_types::ServerName::try_from("storage.googleapis.com")
-            .map_err(|e| StorageError::Tls {
-                detail: format!("invalid server name: {e}"),
+            .map_err(|e| {
+                TlsSnafu {
+                    detail: format!("invalid server name: {e}"),
+                }
+                .build()
             })?
             .to_owned();
 
         let connector = monoio_rustls::TlsConnector::from(self.tls_config.clone());
-        let tls_stream =
-            connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| StorageError::Connection {
-                    detail: "TLS handshake failed".into(),
-                    source: e.into(),
-                })?;
+        let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+            ConnectionSnafu {
+                detail: "TLS handshake failed",
+            }
+            .into_error(e.into())
+        })?;
 
         Ok(tls_stream)
     }
@@ -440,9 +427,8 @@ async fn read_http_response<S: AsyncReadRent>(
     loop {
         let (result, returned_buf) = stream.read(read_buf).await;
         read_buf = returned_buf;
-        let n = result.map_err(|e| StorageError::Connection {
-            detail: "failed to read GCS response".into(),
-            source: e,
+        let n = result.context(ConnectionSnafu {
+            detail: "failed to read GCS response",
         })?;
         if n == 0 {
             break;
@@ -458,11 +444,17 @@ async fn read_http_response<S: AsyncReadRent>(
         }
     }
 
-    let header_end = header_end.ok_or_else(|| StorageError::HttpParse {
-        detail: "incomplete HTTP response headers".into(),
+    let header_end = header_end.ok_or_else(|| {
+        HttpParseSnafu {
+            detail: "incomplete HTTP response headers",
+        }
+        .build()
     })?;
-    let headers = std::str::from_utf8(&buf[..header_end]).map_err(|_| StorageError::HttpParse {
-        detail: "invalid HTTP headers (not UTF-8)".into(),
+    let headers = std::str::from_utf8(&buf[..header_end]).map_err(|_| {
+        HttpParseSnafu {
+            detail: "invalid HTTP headers (not UTF-8)",
+        }
+        .build()
     })?;
 
     // Parse status code
@@ -484,9 +476,8 @@ async fn read_http_response<S: AsyncReadRent>(
             while left > 0 {
                 let (result, returned_buf) = stream.read(read_buf).await;
                 read_buf = returned_buf;
-                let n = result.map_err(|e| StorageError::Connection {
-                    detail: "failed to read GCS response body".into(),
-                    source: e,
+                let n = result.context(ConnectionSnafu {
+                    detail: "failed to read GCS response body",
                 })?;
                 if n == 0 {
                     break;
@@ -501,9 +492,8 @@ async fn read_http_response<S: AsyncReadRent>(
         loop {
             let (result, returned_buf) = stream.read(read_buf).await;
             read_buf = returned_buf;
-            let n = result.map_err(|e| StorageError::Connection {
-                detail: "failed to read GCS response body".into(),
-                source: e,
+            let n = result.context(ConnectionSnafu {
+                detail: "failed to read GCS response body",
             })?;
             if n == 0 {
                 break;
@@ -525,18 +515,24 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 fn parse_status_code(headers: &str) -> error::Result<u16> {
     // "HTTP/1.1 200 OK\r\n..."
-    let status_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| StorageError::HttpParse {
-            detail: "empty HTTP response".into(),
-        })?;
-    let parts: Vec<&str> = status_line.split_whitespace().collect();
-    let code_str = parts.get(1).ok_or_else(|| StorageError::HttpParse {
-        detail: "missing status code in HTTP response".into(),
+    let status_line = headers.lines().next().ok_or_else(|| {
+        HttpParseSnafu {
+            detail: "empty HTTP response",
+        }
+        .build()
     })?;
-    let code: u16 = code_str.parse().map_err(|_| StorageError::HttpParse {
-        detail: format!("invalid status code: {code_str}"),
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    let code_str = parts.get(1).ok_or_else(|| {
+        HttpParseSnafu {
+            detail: "missing status code in HTTP response",
+        }
+        .build()
+    })?;
+    let code: u16 = code_str.parse().map_err(|_| {
+        HttpParseSnafu {
+            detail: format!("invalid status code: {code_str}"),
+        }
+        .build()
     })?;
     Ok(code)
 }

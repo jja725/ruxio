@@ -27,13 +27,14 @@ use ruxio_protocol::messages::{
 };
 use ruxio_storage::cache::{CacheManager, RangeResult};
 use ruxio_storage::cache_trait::Cache;
-use ruxio_storage::error::StorageError;
+use ruxio_storage::error::{DiskIoSnafu, PageAssemblySnafu, StorageError};
 use ruxio_storage::forwarding::{self, ChannelMatrix};
 use ruxio_storage::gcs::GcsClient;
 use ruxio_storage::metadata_cache::{CachedParquetMeta, MetadataCache};
 use ruxio_storage::page_key::PageKey;
 use ruxio_storage::retry::RetryPolicy;
 use ruxio_storage::zero_copy;
+use snafu::IntoError;
 
 // ── Server configuration ────────────────────────────────────────────
 
@@ -536,30 +537,32 @@ pub(crate) async fn read_range(
                                         page_size
                                     );
                                     ctx.cache_manager.borrow_mut().page_cache.remove(&key);
-                                    return Err(StorageError::PageAssembly {
+                                    return Err(PageAssemblySnafu {
                                         detail: format!(
                                             "corrupt page {} (size {} > expected {})",
                                             path.display(),
                                             data.len(),
                                             page_size
                                         ),
-                                    });
+                                    }
+                                    .build());
                                 }
                                 Bytes::from(data)
                             }
                             Err(e) => {
                                 CACHE_GET_ERRORS.inc();
                                 ctx.cache_manager.borrow_mut().page_cache.remove(&key);
-                                return Err(StorageError::DiskIo {
+                                return Err(DiskIoSnafu {
                                     path: path.display().to_string(),
-                                    source: e,
-                                });
+                                }
+                                .into_error(e));
                             }
                         }
                     } else {
-                        return Err(StorageError::PageAssembly {
+                        return Err(PageAssemblySnafu {
                             detail: format!("page {} not found in cache for {}", page_idx, req.uri),
-                        });
+                        }
+                        .build());
                     }
                 };
 

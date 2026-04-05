@@ -1,75 +1,110 @@
 //! Structured error types for the storage crate.
 //!
-//! Inspired by Alluxio's status-based exception hierarchy with explicit
-//! retryability classification. Each error variant carries enough context
-//! for callers to decide whether to retry, propagate, or fail fast.
+//! Follows the Lance error pattern: each variant carries a `Location` for
+//! automatic file/line tracking, and uses `BoxedError` for flexible source
+//! wrapping. This gives typed error matching at boundaries (retry, error codes)
+//! with zero-cost location tracking for debugging.
 
-use snafu::Snafu;
+use snafu::{Location, Snafu};
 
 use crate::retry::GcsError;
 
-/// Structured error type for all storage operations.
-///
-/// Replaces `anyhow::Result` throughout the storage crate to give callers
-/// machine-readable error classification (transient vs permanent).
-#[derive(Debug, Snafu)]
-pub enum StorageError {
-    /// GCS operation failed (wraps the retryable/permanent classification).
-    #[snafu(display("GCS operation failed: {source}"))]
-    Gcs { source: GcsError },
-
-    /// Disk I/O failed during page read/write.
-    #[snafu(display("disk I/O failed for {path}: {source}"))]
-    DiskIo {
-        path: String,
-        source: std::io::Error,
-    },
-
-    /// Page assembly failed (e.g., page not found in cache).
-    #[snafu(display("page assembly failed: {detail}"))]
-    PageAssembly { detail: String },
-
-    /// HTTP response parsing failed.
-    #[snafu(display("HTTP parse error: {detail}"))]
-    HttpParse { detail: String },
-
-    /// TLS/TCP connection failed.
-    #[snafu(display("connection failed: {detail}: {source}"))]
-    Connection {
-        detail: String,
-        source: std::io::Error,
-    },
-
-    /// JSON serialization/deserialization failed.
-    #[snafu(display("serialization failed: {source}"))]
-    Serialization { source: serde_json::Error },
-
-    /// Parquet metadata parsing failed.
-    #[snafu(display("metadata parse error: {source}"))]
-    MetadataParse {
-        source: parquet::errors::ParquetError,
-    },
-
-    /// TLS handshake or configuration error.
-    #[snafu(display("TLS error: {detail}"))]
-    Tls { detail: String },
-
-    /// Response body length mismatch.
-    #[snafu(display("response validation failed: {detail}"))]
-    ResponseValidation { detail: String },
-}
+/// Heap-allocated, type-erased error for flexible source wrapping.
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Convenience alias for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Structured error type for all storage operations.
+///
+/// Each variant carries `Location` (auto-captured at construction site)
+/// for production debugging without backtraces.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum StorageError {
+    /// GCS operation failed (wraps the retryable/permanent classification).
+    #[snafu(display("GCS operation failed: {source}, {location}"))]
+    Gcs {
+        source: GcsError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// Disk I/O failed during page read/write.
+    #[snafu(display("disk I/O failed for {path}: {source}, {location}"))]
+    DiskIo {
+        path: String,
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// Page assembly failed (e.g., page not found in cache).
+    #[snafu(display("page assembly failed: {detail}, {location}"))]
+    PageAssembly {
+        detail: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// HTTP response parsing failed.
+    #[snafu(display("HTTP parse error: {detail}, {location}"))]
+    HttpParse {
+        detail: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// TLS/TCP connection failed.
+    #[snafu(display("connection failed: {detail}: {source}, {location}"))]
+    Connection {
+        detail: String,
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// JSON serialization/deserialization failed.
+    #[snafu(display("serialization failed: {source}, {location}"))]
+    Serialization {
+        source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// Parquet metadata parsing failed.
+    #[snafu(display("metadata parse error: {source}, {location}"))]
+    MetadataParse {
+        source: parquet::errors::ParquetError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// TLS handshake or configuration error.
+    #[snafu(display("TLS error: {detail}, {location}"))]
+    Tls {
+        detail: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    /// Response body length mismatch.
+    #[snafu(display("response validation failed: {detail}, {location}"))]
+    ResponseValidation {
+        detail: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
 impl StorageError {
     /// Whether this error is transient and the operation should be retried.
     ///
-    /// Follows Alluxio's pattern: GCS transient errors (429, 5xx, timeouts)
-    /// are retryable; all other error categories are permanent.
+    /// GCS transient errors (429, 5xx, timeouts) and connection/disk I/O
+    /// errors are retryable; all other categories are permanent.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Gcs { source } => source.is_retryable(),
+            Self::Gcs { source, .. } => source.is_retryable(),
             Self::DiskIo { .. } => true,
             Self::Connection { .. } => true,
             Self::PageAssembly { .. }
@@ -82,13 +117,10 @@ impl StorageError {
     }
 
     /// Map this storage error to a wire protocol error code.
-    ///
-    /// Follows Presto's pattern: each error maps to a specific code with
-    /// type (UserError/InternalError/External) and retryability metadata.
     pub fn to_error_code(&self) -> ruxio_protocol::error_code::ErrorCode {
         use ruxio_protocol::error_code;
         match self {
-            Self::Gcs { source } => match source {
+            Self::Gcs { source, .. } => match source {
                 GcsError::Transient { .. } => error_code::gcs_transient_error(),
                 GcsError::Permanent { .. } => error_code::gcs_permanent_error(),
                 GcsError::Timeout { .. } => error_code::gcs_timeout(),

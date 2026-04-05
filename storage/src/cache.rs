@@ -5,8 +5,10 @@ use bytes::Bytes;
 
 use ruxio_protocol::messages::ReadRangeRequest;
 
+use snafu::ResultExt;
+
 use crate::cache_trait::Cache;
-use crate::error::StorageError;
+use crate::error::{DiskIoSnafu, MetadataParseSnafu, PageAssemblySnafu};
 use crate::metadata_cache::{CachedParquetMeta, MetadataCache};
 use crate::page_cache::{CachedPage, PageCache};
 use crate::page_key::PageKey;
@@ -130,15 +132,15 @@ impl CacheManager {
             // Fast path: single full page — read directly, no slicing
             let key = PageKey::with_arc(file_id, first_page);
             if let Some(page) = self.page_cache.get(&key) {
-                let data = std::fs::read(&page.local_path).map_err(|e| StorageError::DiskIo {
+                let data = std::fs::read(&page.local_path).context(DiskIoSnafu {
                     path: page.local_path.display().to_string(),
-                    source: e,
                 })?;
                 return Ok(Bytes::from(data));
             }
-            return Err(StorageError::PageAssembly {
+            return PageAssemblySnafu {
                 detail: format!("page {} not found in cache for {}", first_page, req.uri),
-            });
+            }
+            .fail();
         }
 
         // Multi-page or partial: read each page, slice, assemble
@@ -148,16 +150,15 @@ impl CacheManager {
             let page_offset = page_idx * page_size;
             let key = PageKey::with_arc(file_id.clone(), page_idx);
 
-            let page = self
-                .page_cache
-                .get(&key)
-                .ok_or_else(|| StorageError::PageAssembly {
+            let page = self.page_cache.get(&key).ok_or_else(|| {
+                PageAssemblySnafu {
                     detail: format!("page {} not found in cache for {}", page_idx, req.uri),
-                })?;
+                }
+                .build()
+            })?;
 
-            let page_data = std::fs::read(&page.local_path).map_err(|e| StorageError::DiskIo {
+            let page_data = std::fs::read(&page.local_path).context(DiskIoSnafu {
                 path: page.local_path.display().to_string(),
-                source: e,
             })?;
 
             let page_end = page_offset + page_data.len() as u64;
@@ -262,7 +263,7 @@ impl CacheManager {
     ) -> crate::error::Result<CachedParquetMeta> {
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&footer_bytes)
-            .map_err(|e| StorageError::MetadataParse { source: e })?;
+            .context(MetadataParseSnafu)?;
 
         let cached = CachedParquetMeta {
             metadata: std::sync::Arc::new(metadata),
