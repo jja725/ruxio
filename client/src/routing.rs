@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ruxio_cluster::ring::NodeId;
 use ruxio_protocol::frame::Frame;
 
@@ -7,15 +9,12 @@ use crate::membership::ClientMembership;
 use crate::response::Response;
 
 use crate::error::ServerSnafu;
+
 /// Route a request to the correct server and handle retries/redirects.
 ///
-/// Flow:
-/// 1. Hash the URI to find the owning node via consistent hash ring
-/// 2. Send the request to that node
-/// 3. On success: return the response
-/// 4. On redirect: follow the redirect target (stale ring)
-/// 5. On retriable error: invalidate connection, retry
-/// 6. On non-retriable error: return immediately
+/// Uses failed-worker blacklisting (like Alluxio's retry logic): on failure,
+/// the failed node is blacklisted and the next candidate from the hash ring
+/// is tried. On redirect, the redirect target is used directly.
 pub(crate) async fn route_and_execute(
     uri: &str,
     frame: Frame,
@@ -24,13 +23,14 @@ pub(crate) async fn route_and_execute(
     max_retries: u32,
 ) -> error::Result<Response> {
     let mut target_override: Option<NodeId> = None;
+    let mut failed_nodes: HashSet<NodeId> = HashSet::new();
 
     for _attempt in 0..=max_retries {
         // Pick target: explicit override (from redirect) or hash ring
         let node = if let Some(ref target) = target_override {
             target.clone()
         } else {
-            match membership.owner(uri) {
+            match pick_node(membership, uri, &failed_nodes) {
                 Some(n) => n,
                 None => {
                     return Err(NoServerAvailableSnafu {
@@ -41,7 +41,6 @@ pub(crate) async fn route_and_execute(
             }
         };
 
-        // Re-encode the frame for each attempt (Frame is consumed by encode)
         let request_frame = Frame {
             msg_type: frame.msg_type,
             request_id: frame.request_id,
@@ -50,7 +49,6 @@ pub(crate) async fn route_and_execute(
 
         match pool.send_to(&node, request_frame).await {
             Ok(Response::Redirect { host, port }) => {
-                // Server says we have a stale ring — follow the redirect
                 tracing::debug!("Redirect for {uri} → {host}:{port}");
                 target_override = Some(NodeId::new(host, port));
                 continue;
@@ -62,7 +60,8 @@ pub(crate) async fn route_and_execute(
                 if error_code.retriable {
                     tracing::debug!("Retriable error for {uri} on {node}: {message}, retrying");
                     pool.invalidate(&node);
-                    target_override = None; // go back to hash ring
+                    failed_nodes.insert(node);
+                    target_override = None;
                     continue;
                 }
                 return Err(ServerSnafu {
@@ -75,6 +74,7 @@ pub(crate) async fn route_and_execute(
             Err(e) => {
                 tracing::debug!("Connection error for {uri} on {node}: {e}, retrying");
                 pool.invalidate(&node);
+                failed_nodes.insert(node);
                 target_override = None;
                 continue;
             }
@@ -86,4 +86,19 @@ pub(crate) async fn route_and_execute(
         max: max_retries,
     }
     .build())
+}
+
+/// Pick the best available node, skipping any that have already failed.
+///
+/// Uses `get_nodes()` to get multiple candidates from the hash ring,
+/// then returns the first one not in the blacklist. Falls back to the
+/// least recently failed node if all candidates have failed.
+fn pick_node(membership: &ClientMembership, uri: &str, failed: &HashSet<NodeId>) -> Option<NodeId> {
+    if failed.is_empty() {
+        return membership.owner(uri);
+    }
+
+    // Get multiple candidates from the ring — try up to the total node count
+    let candidates = membership.candidates(uri, failed.len() + 1);
+    candidates.into_iter().find(|n| !failed.contains(n))
 }

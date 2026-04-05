@@ -33,6 +33,19 @@ impl ClientMembership {
         self.ring.borrow().get_node(uri).cloned()
     }
 
+    /// Get multiple candidate nodes for a URI, ordered by ring position.
+    ///
+    /// Used for retry with failed-node blacklisting: if the primary owner
+    /// fails, try the next node on the ring.
+    pub fn candidates(&self, uri: &str, n: usize) -> Vec<NodeId> {
+        self.ring
+            .borrow()
+            .get_nodes(uri, n)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     /// Get all current nodes.
     pub fn nodes(&self) -> Vec<NodeId> {
         self.ring.borrow().nodes().to_vec()
