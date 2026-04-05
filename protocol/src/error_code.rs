@@ -9,6 +9,8 @@
 //! - `0x0002_xxxx` — Resource exhaustion
 //! - `0x0003_xxxx` — External system errors (GCS, etc.)
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// Who is at fault for this error.
@@ -37,7 +39,7 @@ pub struct ErrorCode {
     /// Unique numeric code (e.g., 0x0000_0001).
     pub code: u32,
     /// Human-readable error name (e.g., "INVALID_REQUEST").
-    pub name: String,
+    pub name: Cow<'static, str>,
     /// Error category — who is at fault.
     pub error_type: ErrorType,
     /// Whether the client should retry this operation.
@@ -50,12 +52,12 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
-/// Helper to construct an `ErrorCode` constant without heap allocation at call sites.
+/// Helper to construct an `ErrorCode` constant.
 macro_rules! error_code {
     ($code:expr, $name:expr, $etype:expr, $retriable:expr) => {
         ErrorCode {
             code: $code,
-            name: String::from($name),
+            name: Cow::Borrowed($name),
             error_type: $etype,
             retriable: $retriable,
         }

@@ -165,28 +165,24 @@ pub fn metrics_result() -> String {
     if let Err(e) = encoder.encode(&REGISTRY.gather(), &mut buffer) {
         warn!("could not encode custom metrics: {}", e);
     };
-    let mut res = match String::from_utf8(buffer.clone()) {
+    let mut res = match String::from_utf8(buffer) {
         Ok(v) => v,
         Err(e) => {
             warn!("custom metrics could not be from_utf8'd: {}", e);
             String::default()
         }
     };
-    buffer.clear();
 
     let mut buffer = Vec::new();
     if let Err(e) = encoder.encode(&prometheus::gather(), &mut buffer) {
         warn!("could not encode prometheus metrics: {}", e);
     };
-    let res_custom = match String::from_utf8(buffer.clone()) {
-        Ok(v) => v,
+    match String::from_utf8(buffer) {
+        Ok(v) => res.push_str(&v),
         Err(e) => {
             warn!("prometheus metrics could not be from_utf8'd: {}", e);
-            String::default()
         }
     };
-    buffer.clear();
 
-    res.push_str(&res_custom);
     res
 }

@@ -173,14 +173,7 @@ impl RequestTracker {
         error_code: ruxio_protocol::error_code::ErrorCode,
         message: String,
     ) -> Frame {
-        Frame::new_json_unchecked(
-            MessageType::Error,
-            self.request_id,
-            &ErrorResponse {
-                error_code,
-                message,
-            },
-        )
+        error_response_frame(self.request_id, error_code, message)
     }
 }
 
@@ -213,14 +206,6 @@ impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-/// Classify an error into a structured ErrorCode.
-///
-/// StorageError maps directly via `to_error_code()`.
-/// For any other error type, falls back to GENERIC_INTERNAL_ERROR.
-fn classify_error(err: &StorageError) -> ruxio_protocol::error_code::ErrorCode {
-    err.to_error_code()
 }
 
 /// Write a frame to the stream with a timeout. Returns bytes written or error.
@@ -661,7 +646,7 @@ async fn scan_streaming(
             Err(e) => {
                 if tracker.is_streaming() {
                     let err_frame =
-                        tracker.error_frame(classify_error(&e), format!("Scan read failed: {e}"));
+                        tracker.error_frame(e.to_error_code(), format!("Scan read failed: {e}"));
                     let _ = write_frame_with_timeout(stream, err_frame, write_timeout).await;
                 }
                 tracker.error();
@@ -786,7 +771,7 @@ async fn process_frame(
                         tracker.error();
                         return vec![error_response_frame(
                             request_id,
-                            classify_error(&e),
+                            e.to_error_code(),
                             format!("Batch read failed: {e}"),
                         )];
                     }
@@ -823,7 +808,7 @@ async fn process_frame(
                 }
                 Err(e) => vec![error_response_frame(
                     request_id,
-                    classify_error(&e),
+                    e.to_error_code(),
                     format!("Metadata fetch failed: {e}"),
                 )],
             }
@@ -844,7 +829,7 @@ async fn process_frame(
             if let Err(e) = scan_streaming(ctx, &req, request_id, stream).await {
                 return vec![error_response_frame(
                     request_id,
-                    classify_error(&e),
+                    e.to_error_code(),
                     format!("Scan failed: {e}"),
                 )];
             }
@@ -972,7 +957,7 @@ async fn handle_read_range(
             ],
             Err(e) => vec![error_response_frame(
                 request_id,
-                classify_error(&e),
+                e.to_error_code(),
                 format!("Read failed: {e}"),
             )],
         }
