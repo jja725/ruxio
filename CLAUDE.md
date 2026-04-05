@@ -48,7 +48,9 @@ All configuration is in TOML files + env vars. See `common/src/settings.rs` for 
 
 ## Coding Style & Naming Conventions
 
-**Optimize for the reader.** Code is read far more often than it is written. Every naming choice, comment, and abstraction should serve the person reading the code next — not the person writing it now.
+**Optimize for the reader.** Code is read far more often than it is written. Every naming choice, comment, and abstraction should serve the person reading the code next — not the person writing it now. When readability conflicts with a style rule, readability wins.
+
+**Be consistent with surrounding code.** When editing an existing file, match its local conventions — even if you'd write it differently from scratch. Consistency within a file matters more than personal preference.
 
 Evaluate every change across three axes: **correctness & maintainability**, **safety** (thread safety, bounded resources, error handling), and **user-friendliness** (clear config names, documentation, error messages).
 
@@ -69,6 +71,7 @@ Evaluate every change across three axes: **correctness & maintainability**, **sa
 - Prefix booleans with `is_` or `has_`; default booleans to `false`. Use `disable_*` instead of `enable_*` when the feature defaults to on.
 - **Avoid generic module names** like `utils.rs`, `helpers.rs` — name modules after the concept they represent (e.g., `retry.rs`, `ring.rs`). Ask: "what do these functions have in common beyond being useful?"
 - Name functions to reflect their actual scope — `handle_page_eviction` not `handle_eviction` if only page eviction is handled.
+- **Avoid generic `get_` prefixes** — use verbs that convey what actually happens: `find_` (lookup, may fail), `fetch_` (remote/expensive), `compute_` (derived), `load_` (from disk/storage). Reserve `get_` only for trivial field accessors.
 - **`_` prefix is only for truly unused bindings.** If you read the variable, drop the underscore. `_foo` means "I know this is unused, and that's intentional."
 - Use **type aliases for domain concepts** at API boundaries — `type PageId = u64;` or a newtype wrapper, not raw `u64` everywhere. This turns the type system into documentation.
 - Use **named constants** for magic numbers and strings — no bare `4096`, `64`, `"default"` in logic. Give them a name that explains the intent: `const PAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;`.
@@ -89,8 +92,9 @@ Evaluate every change across three axes: **correctness & maintainability**, **sa
 ### Iterator & Control Flow Discipline
 - Use `let Some(x) = iter.next() else { return Err(...) }` — never call `.next()` twice (once to check, once to use).
 - When advancing multiple iterators in lockstep, advance *all* of them before any `continue` or conditional branch. An early `continue` that skips a `.next()` causes silent misalignment.
-- Prefer iterator chains (`.filter().map().collect()`) over manual `for` loops with `push` — unless the loop body has complex control flow or multiple side effects.
+- Prefer iterator chains (`.filter().map().collect()`) over manual `for` loops with `push` — unless the loop body has complex control flow or multiple side effects. **Exception: avoid iterator chains in hot loops or performance-sensitive sections** where the abstraction cost matters; use explicit `for` loops for clarity and control.
 - Use `for (i, item) in collection.iter().enumerate()` not manual index tracking.
+- **No wildcard `_ =>` in `match` on owned enums.** Use exhaustive patterns so the compiler catches missing variants when new ones are added. Use `_ =>` only for borrowed/external enums you don't control.
 
 ### API Design
 - Keep public APIs minimal — prefer `pub(crate)` with selective `pub use` re-exports over broad `pub` visibility.
@@ -141,7 +145,7 @@ Evaluate every change across three axes: **correctness & maintainability**, **sa
 - **No `.unwrap()` in production code** — use `match`, `if let`, `let...else`, or `?`. Reserve `.unwrap()` for tests only. If truly unavoidable, use `.expect("reason")`.
 - **No silent `let _ =` on `Result`** — log at `debug` or `warn` level, or increment an error metric.
 - Use `thiserror` for error types in libraries, `anyhow` for binaries and tests.
-- **Match error variants to root causes**: invalid input errors for caller data issues, corruption errors for integrity problems, not-found for missing resources, I/O errors for system failures. Do not use a generic catch-all.
+- **Match error variants to root causes**: invalid input errors for caller data issues, corruption errors for integrity problems, not-found for missing resources, I/O errors for system failures. Do not use a generic catch-all. Use specific variants so failure frequencies can be tracked via Prometheus metrics — a single `StorageError::Io` is far less useful than `StorageError::ConnectionTimeout` vs `StorageError::DiskFull`.
 - Include full context in error messages: variable names, actual values, sizes, types, indices. `"Page offset {} exceeds file size {}"` not `"Invalid offset"`.
 - Validate inputs at API boundaries and reject invalid values with descriptive errors — never silently clamp, adjust, or default.
 - Validate mutually exclusive options in builders/configs — return a clear error if both are set.
@@ -183,6 +187,7 @@ Evaluate every change across three axes: **correctness & maintainability**, **sa
 - Use `rstest` for tests that differ only in inputs — use `#[case::{name}(...)]` for readable case names.
 - Extend existing test modules instead of adding overlapping new ones; group related tests next to the functionality they cover.
 - **Tests must be deterministic** — no random seeds without fixed values, no `std::thread::sleep` for synchronization; use explicit conditions, channels, or polling with bounded retries.
+- **No mocking libraries.** Write manual test doubles (stub structs that implement the trait) to keep tests simple and encourage testable designs. If a type is hard to test without mocks, that's a signal to refactor the interface.
 - Use `assert_eq!`/`assert_ne!` over `assert!(a == b)` — the former prints actual values on failure.
 - Assert on both error type and message content — don't just check `is_err()`.
 - **If a test fails, assume the code is wrong.** Only update the test expectation after verifying the code is correct. Never reflexively adjust tests to make them pass.
