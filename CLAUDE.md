@@ -44,7 +44,7 @@ All tunables live in `common/src/settings.rs` as TOML + env vars. No CLI args fo
 
 ## Logging (Project-Specific)
 
-- Use `tracing` for all logging. The `log` and `fern` crates are not used.
+- Use `tracing` for all logging.
   - `debug!` — routine ops (cache hits, connection recycling).
   - `info!` — state changes (server started, member joined ring).
   - `warn!` — unexpected conditions that are handled (retry triggered).
