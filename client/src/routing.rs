@@ -1,6 +1,7 @@
 use ruxio_cluster::ring::NodeId;
 use ruxio_protocol::frame::Frame;
 
+use crate::config::RoutingStrategy;
 use crate::connection::ConnectionPool;
 use crate::error::{self, NoServerAvailableSnafu, RetriesExhaustedSnafu};
 use crate::membership::ClientMembership;
@@ -9,26 +10,26 @@ use crate::response::Response;
 use crate::error::ServerSnafu;
 
 /// Route a request to the correct server and handle retries/redirects.
-///
-/// Uses failed-worker blacklisting (like Alluxio's retry logic): on failure,
-/// the failed node is blacklisted and the next candidate from the hash ring
-/// is tried. On redirect, the redirect target is used directly.
 pub(crate) async fn route_and_execute(
     uri: &str,
     frame: Frame,
     membership: &ClientMembership,
     pool: &ConnectionPool,
     max_retries: u32,
+    routing: &RoutingStrategy,
 ) -> error::Result<Response> {
     let mut target_override: Option<NodeId> = None;
     let mut failed_nodes: Vec<NodeId> = Vec::new();
 
     for _attempt in 0..=max_retries {
-        // Pick target: explicit override (from redirect) or hash ring
         let node = if let Some(ref target) = target_override {
             target.clone()
         } else {
-            match pick_node(membership, uri, &failed_nodes) {
+            let picked = match routing {
+                RoutingStrategy::ClientSideHashRing => pick_node(membership, uri, &failed_nodes),
+                RoutingStrategy::ServerSideRouting => pick_any_node(membership, &failed_nodes),
+            };
+            match picked {
                 Some(n) => n,
                 None => {
                     return Err(NoServerAvailableSnafu {
@@ -86,17 +87,23 @@ pub(crate) async fn route_and_execute(
     .build())
 }
 
-/// Pick the best available node, skipping any that have already failed.
-///
-/// Uses `get_nodes()` to get multiple candidates from the hash ring,
-/// then returns the first one not in the blacklist. Falls back to the
-/// least recently failed node if all candidates have failed.
+/// Pick the owning node via hash ring, skipping failed nodes.
 fn pick_node(membership: &ClientMembership, uri: &str, failed: &[NodeId]) -> Option<NodeId> {
     if failed.is_empty() {
         return membership.owner(uri);
     }
-
-    // Get multiple candidates from the ring — try up to the total node count
     let candidates = membership.candidates(uri, failed.len() + 1);
     candidates.into_iter().find(|n| !failed.contains(n))
+}
+
+/// Pick any available node randomly, skipping failed nodes.
+fn pick_any_node(membership: &ClientMembership, failed: &[NodeId]) -> Option<NodeId> {
+    let nodes = membership.nodes();
+    let available: Vec<_> = nodes.into_iter().filter(|n| !failed.contains(n)).collect();
+    if available.is_empty() {
+        return None;
+    }
+    // Simple pseudo-random: use TSC or pointer-based entropy to avoid rand dependency
+    let idx = (std::time::Instant::now().elapsed().subsec_nanos() as usize) % available.len();
+    Some(available[idx].clone())
 }

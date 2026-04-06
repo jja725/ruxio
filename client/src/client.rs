@@ -19,9 +19,11 @@ use crate::routing::route_and_execute;
 
 /// Client-side reader for a Ruxio distributed Parquet cache cluster.
 ///
-/// Maintains a consistent hash ring from the cluster membership and routes
-/// each request directly to the owning server by file path. Falls back to
-/// server-side redirects if the local ring is stale.
+/// Supports two routing strategies (configurable via `RoutingStrategy`):
+/// - `ClientSideHashRing` (default): client hashes the file path and sends
+///   directly to the owning server. Fastest — no redirects on happy path.
+/// - `ServerSideRouting`: client sends to any server via round-robin; server
+///   handles routing internally via Redirect responses.
 ///
 /// Each monoio worker thread should create its own `RuxioClient` instance.
 /// The client is `!Send` (uses `Rc`/`RefCell` internally).
@@ -106,6 +108,7 @@ impl RuxioClient {
             &self.membership,
             &self.pool,
             self.config.max_retries,
+            &self.config.routing,
         )
         .await?
         {
@@ -138,6 +141,7 @@ impl RuxioClient {
             &self.membership,
             &self.pool,
             self.config.max_retries,
+            &self.config.routing,
         )
         .await?
         {
@@ -180,6 +184,7 @@ impl RuxioClient {
             &self.membership,
             &self.pool,
             self.config.max_retries,
+            &self.config.routing,
         )
         .await?
         {
