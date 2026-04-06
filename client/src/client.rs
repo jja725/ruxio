@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -19,11 +20,10 @@ use crate::routing::route_and_execute;
 
 /// Client-side reader for a Ruxio distributed Parquet cache cluster.
 ///
-/// Supports two routing strategies (configurable via `RoutingStrategy`):
-/// - `ClientSideHashRing` (default): client hashes the file path and sends
-///   directly to the owning server. Fastest — no redirects on happy path.
-/// - `ServerSideRouting`: client sends to any server via round-robin; server
-///   handles routing internally via Redirect responses.
+/// Builds a consistent hash ring from the cluster membership and routes
+/// each request directly to the owning server by file path. The ring
+/// is refreshed automatically on a configurable interval and immediately
+/// on receiving a Redirect (stale ring signal).
 ///
 /// Each monoio worker thread should create its own `RuxioClient` instance.
 /// The client is `!Send` (uses `Rc`/`RefCell` internally).
@@ -45,11 +45,14 @@ impl RuxioClient {
         };
 
         let nodes: Vec<NodeId> = servers.iter().map(|s| NodeId(s.clone())).collect();
-
-        // Static membership has no events
         let (_tx, rx) = mpsc::channel();
 
-        let membership = Rc::new(ClientMembership::new(nodes, config.vnodes_per_node, rx));
+        let membership = Rc::new(ClientMembership::new(
+            nodes,
+            config.vnodes_per_node,
+            rx,
+            Duration::from_secs(config.membership_refresh_secs),
+        ));
         let pool = Rc::new(ConnectionPool::new(
             config.connect_timeout,
             config.read_timeout,
@@ -67,6 +70,7 @@ impl RuxioClient {
     ///
     /// Discovers servers from etcd and watches for membership changes.
     /// The client does NOT register itself — it is a passive observer.
+    /// The hash ring refreshes automatically via the event channel.
     pub fn with_etcd(
         initial_members: Vec<NodeId>,
         event_rx: mpsc::Receiver<MembershipEvent>,
@@ -76,6 +80,7 @@ impl RuxioClient {
             initial_members,
             config.vnodes_per_node,
             event_rx,
+            Duration::from_secs(config.membership_refresh_secs),
         ));
         let pool = Rc::new(ConnectionPool::new(
             config.connect_timeout,
@@ -92,8 +97,8 @@ impl RuxioClient {
 
     /// Read a byte range from a cached Parquet file.
     ///
-    /// The URI is hashed to determine the owning server. If the server
-    /// returns a redirect (stale ring), the client follows it automatically.
+    /// The URI is hashed to determine the owning server. On redirect
+    /// (stale ring), the ring is refreshed and the request retried.
     pub async fn read_range(&self, uri: &str, offset: u64, length: u64) -> error::Result<Bytes> {
         let req = ReadRangeRequest {
             uri: uri.to_string(),
@@ -108,7 +113,6 @@ impl RuxioClient {
             &self.membership,
             &self.pool,
             self.config.max_retries,
-            &self.config.routing,
         )
         .await?
         {
@@ -141,7 +145,6 @@ impl RuxioClient {
             &self.membership,
             &self.pool,
             self.config.max_retries,
-            &self.config.routing,
         )
         .await?
         {
@@ -184,7 +187,6 @@ impl RuxioClient {
             &self.membership,
             &self.pool,
             self.config.max_retries,
-            &self.config.routing,
         )
         .await?
         {
@@ -193,18 +195,6 @@ impl RuxioClient {
                 msg_type: other.msg_type(),
             }
             .build()),
-        }
-    }
-
-    /// Poll membership events and update the hash ring.
-    ///
-    /// Call this periodically (e.g., every 1-5 seconds) or after detecting
-    /// a redirect to refresh the local routing table.
-    pub fn poll_membership(&self) {
-        if self.membership.poll_events() {
-            let nodes = self.membership.nodes();
-            self.pool.update_membership(&nodes);
-            tracing::info!("Hash ring updated: {} nodes", nodes.len());
         }
     }
 

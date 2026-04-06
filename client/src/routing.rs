@@ -1,22 +1,23 @@
 use ruxio_cluster::ring::NodeId;
 use ruxio_protocol::frame::Frame;
 
-use crate::config::RoutingStrategy;
 use crate::connection::ConnectionPool;
-use crate::error::{self, NoServerAvailableSnafu, RetriesExhaustedSnafu};
+use crate::error::{self, NoServerAvailableSnafu, RetriesExhaustedSnafu, ServerSnafu};
 use crate::membership::ClientMembership;
 use crate::response::Response;
 
-use crate::error::ServerSnafu;
-
-/// Route a request to the correct server and handle retries/redirects.
+/// Route a request to the correct server via client-side hash ring.
+///
+/// On redirect (stale ring): force-refreshes the membership view,
+/// then follows the redirect target.
+/// On retriable error: blacklists the failed node, tries the next
+/// candidate from the hash ring.
 pub(crate) async fn route_and_execute(
     uri: &str,
     frame: Frame,
     membership: &ClientMembership,
     pool: &ConnectionPool,
     max_retries: u32,
-    routing: &RoutingStrategy,
 ) -> error::Result<Response> {
     let mut target_override: Option<NodeId> = None;
     let mut failed_nodes: Vec<NodeId> = Vec::new();
@@ -25,11 +26,7 @@ pub(crate) async fn route_and_execute(
         let node = if let Some(ref target) = target_override {
             target.clone()
         } else {
-            let picked = match routing {
-                RoutingStrategy::ClientSideHashRing => pick_node(membership, uri, &failed_nodes),
-                RoutingStrategy::ServerSideRouting => pick_any_node(membership, &failed_nodes),
-            };
-            match picked {
+            match pick_node(membership, uri, &failed_nodes) {
                 Some(n) => n,
                 None => {
                     return Err(NoServerAvailableSnafu {
@@ -48,7 +45,10 @@ pub(crate) async fn route_and_execute(
 
         match pool.send_to(&node, request_frame).await {
             Ok(Response::Redirect { host, port }) => {
-                tracing::debug!("Redirect for {uri} → {host}:{port}");
+                // Stale ring — refresh membership and follow the redirect target.
+                tracing::debug!("Redirect for {uri} → {host}:{port}, refreshing ring");
+                membership.force_refresh();
+                pool.update_membership(&membership.nodes());
                 target_override = Some(NodeId::new(host, port));
                 continue;
             }
@@ -94,16 +94,4 @@ fn pick_node(membership: &ClientMembership, uri: &str, failed: &[NodeId]) -> Opt
     }
     let candidates = membership.candidates(uri, failed.len() + 1);
     candidates.into_iter().find(|n| !failed.contains(n))
-}
-
-/// Pick any available node randomly, skipping failed nodes.
-fn pick_any_node(membership: &ClientMembership, failed: &[NodeId]) -> Option<NodeId> {
-    let nodes = membership.nodes();
-    let available: Vec<_> = nodes.into_iter().filter(|n| !failed.contains(n)).collect();
-    if available.is_empty() {
-        return None;
-    }
-    // Simple pseudo-random: use TSC or pointer-based entropy to avoid rand dependency
-    let idx = (std::time::Instant::now().elapsed().subsec_nanos() as usize) % available.len();
-    Some(available[idx].clone())
 }
