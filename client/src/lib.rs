@@ -1,9 +1,10 @@
 pub mod client;
 pub mod config;
-pub mod connection;
 pub mod error;
-pub mod membership;
 pub mod response;
+
+pub(crate) mod connection;
+pub(crate) mod membership;
 mod routing;
 
 pub use client::RuxioClient;

@@ -192,7 +192,15 @@ impl ConnectionPool {
             .borrow_mut()
             .get_mut(node)
             .and_then(|c| c.take())
-            .expect("connection was just established");
+            .ok_or_else(|| {
+                ConnectionFailedSnafu {
+                    addr: node.0.clone(),
+                }
+                .into_error(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "connection unavailable after connect",
+                ))
+            })?;
 
         let result = conn.send_request(frame).await;
 

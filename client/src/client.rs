@@ -110,13 +110,18 @@ impl RuxioClient {
         .await?
         {
             Response::Data(data) => Ok(data),
-            Response::Metadata(_) => Err(UnexpectedResponseSnafu {
-                msg_type: MessageType::Metadata,
+            Response::Error {
+                error_code,
+                message,
+            } => Err(crate::error::ServerSnafu {
+                error_code,
+                message,
             }
             .build()),
-            Response::Redirect { .. } | Response::Error { .. } => {
-                unreachable!("handled by route_and_execute")
+            other => Err(UnexpectedResponseSnafu {
+                msg_type: other.msg_type(),
             }
+            .build()),
         }
     }
 
@@ -137,13 +142,18 @@ impl RuxioClient {
         .await?
         {
             Response::Metadata(meta) => Ok(meta),
-            Response::Data(_) => Err(UnexpectedResponseSnafu {
-                msg_type: MessageType::DataChunk,
+            Response::Error {
+                error_code,
+                message,
+            } => Err(crate::error::ServerSnafu {
+                error_code,
+                message,
             }
             .build()),
-            Response::Redirect { .. } | Response::Error { .. } => {
-                unreachable!("handled by route_and_execute")
+            other => Err(UnexpectedResponseSnafu {
+                msg_type: other.msg_type(),
             }
+            .build()),
         }
     }
 
