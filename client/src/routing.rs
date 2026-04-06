@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use ruxio_cluster::ring::NodeId;
 use ruxio_protocol::frame::Frame;
 
@@ -23,7 +21,7 @@ pub(crate) async fn route_and_execute(
     max_retries: u32,
 ) -> error::Result<Response> {
     let mut target_override: Option<NodeId> = None;
-    let mut failed_nodes: HashSet<NodeId> = HashSet::new();
+    let mut failed_nodes: Vec<NodeId> = Vec::new();
 
     for _attempt in 0..=max_retries {
         // Pick target: explicit override (from redirect) or hash ring
@@ -60,7 +58,7 @@ pub(crate) async fn route_and_execute(
                 if error_code.retriable {
                     tracing::debug!("Retriable error for {uri} on {node}: {message}, retrying");
                     pool.invalidate(&node);
-                    failed_nodes.insert(node);
+                    failed_nodes.push(node);
                     target_override = None;
                     continue;
                 }
@@ -74,7 +72,7 @@ pub(crate) async fn route_and_execute(
             Err(e) => {
                 tracing::debug!("Connection error for {uri} on {node}: {e}, retrying");
                 pool.invalidate(&node);
-                failed_nodes.insert(node);
+                failed_nodes.push(node);
                 target_override = None;
                 continue;
             }
@@ -93,7 +91,7 @@ pub(crate) async fn route_and_execute(
 /// Uses `get_nodes()` to get multiple candidates from the hash ring,
 /// then returns the first one not in the blacklist. Falls back to the
 /// least recently failed node if all candidates have failed.
-fn pick_node(membership: &ClientMembership, uri: &str, failed: &HashSet<NodeId>) -> Option<NodeId> {
+fn pick_node(membership: &ClientMembership, uri: &str, failed: &[NodeId]) -> Option<NodeId> {
     if failed.is_empty() {
         return membership.owner(uri);
     }

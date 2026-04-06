@@ -26,6 +26,8 @@ pub(crate) struct Connection {
     stream: TcpStream,
     reader: FrameReader,
     read_timeout: Duration,
+    /// Reusable read buffer — avoids 128KB allocation per request.
+    recv_buf: Vec<u8>,
 }
 
 impl Connection {
@@ -58,6 +60,7 @@ impl Connection {
             stream,
             reader: FrameReader::new(),
             read_timeout,
+            recv_buf: vec![0u8; RECV_BUFFER_BYTES],
         })
     }
 
@@ -66,14 +69,14 @@ impl Connection {
     /// Reads DataChunk frames until a Done, Error, Redirect, or Metadata
     /// frame terminates the exchange.
     pub async fn send_request(&mut self, frame: Frame) -> error::Result<Response> {
-        // Send
+        // Send — encode returns Bytes, write_all takes ownership (no .to_vec() copy)
         let encoded = frame.encode().to_vec();
         let (result, _) = self.stream.write_all(encoded).await;
         result.context(WriteFailedSnafu)?;
 
-        // Collect response
+        // Collect response using connection-owned buffer
         let mut data = BytesMut::new();
-        let mut buf = vec![0u8; RECV_BUFFER_BYTES];
+        let mut buf = std::mem::take(&mut self.recv_buf);
 
         loop {
             let read_result = monoio::time::timeout(self.read_timeout, self.stream.read(buf)).await;
@@ -108,9 +111,11 @@ impl Connection {
                         data.extend_from_slice(&resp.payload);
                     }
                     MessageType::Done => {
+                        self.recv_buf = buf;
                         return Ok(Response::Data(data.freeze()));
                     }
                     MessageType::Error => {
+                        self.recv_buf = buf;
                         let err: ErrorResponse =
                             serde_json::from_slice(&resp.payload).context(DeserializationSnafu)?;
                         return Ok(Response::Error {
@@ -119,6 +124,7 @@ impl Connection {
                         });
                     }
                     MessageType::Redirect => {
+                        self.recv_buf = buf;
                         let redir: RedirectResponse =
                             serde_json::from_slice(&resp.payload).context(DeserializationSnafu)?;
                         return Ok(Response::Redirect {
@@ -127,6 +133,7 @@ impl Connection {
                         });
                     }
                     MessageType::Metadata => {
+                        self.recv_buf = buf;
                         let meta: MetadataResponse =
                             serde_json::from_slice(&resp.payload).context(DeserializationSnafu)?;
                         return Ok(Response::Metadata(MetadataResult {

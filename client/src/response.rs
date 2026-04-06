@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use ruxio_protocol::frame::MessageType;
 
 /// Parquet file metadata returned by `get_metadata`.
 #[derive(Debug)]
@@ -22,4 +23,15 @@ pub(crate) enum Response {
     },
     /// Metadata response.
     Metadata(MetadataResult),
+}
+
+impl Response {
+    pub(crate) fn msg_type(&self) -> MessageType {
+        match self {
+            Self::Data(_) => MessageType::DataChunk,
+            Self::Redirect { .. } => MessageType::Redirect,
+            Self::Error { .. } => MessageType::Error,
+            Self::Metadata(_) => MessageType::Metadata,
+        }
+    }
 }

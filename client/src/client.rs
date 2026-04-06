@@ -12,7 +12,7 @@ use ruxio_protocol::predicate::PredicateExpr;
 
 use crate::config::{ClientConfig, MembershipConfig};
 use crate::connection::ConnectionPool;
-use crate::error::{self, MembershipSnafu};
+use crate::error::{self, UnexpectedResponseSnafu};
 use crate::membership::ClientMembership;
 use crate::response::{MetadataResult, Response};
 use crate::routing::route_and_execute;
@@ -34,10 +34,12 @@ pub struct RuxioClient {
 
 impl RuxioClient {
     /// Create a client with static membership (fixed list of server addresses).
+    ///
+    /// Panics if `config.membership` is not `MembershipConfig::Static`.
     pub fn with_static(config: ClientConfig) -> Self {
         let servers = match &config.membership {
             MembershipConfig::Static { servers } => servers.clone(),
-            _ => vec![],
+            _ => panic!("with_static requires MembershipConfig::Static"),
         };
 
         let nodes: Vec<NodeId> = servers.iter().map(|s| NodeId(s.clone())).collect();
@@ -108,8 +110,8 @@ impl RuxioClient {
         .await?
         {
             Response::Data(data) => Ok(data),
-            Response::Metadata(_) => Err(MembershipSnafu {
-                detail: "unexpected metadata response for read_range".to_string(),
+            Response::Metadata(_) => Err(UnexpectedResponseSnafu {
+                msg_type: MessageType::Metadata,
             }
             .build()),
             Response::Redirect { .. } | Response::Error { .. } => {
@@ -135,8 +137,8 @@ impl RuxioClient {
         .await?
         {
             Response::Metadata(meta) => Ok(meta),
-            Response::Data(_) => Err(MembershipSnafu {
-                detail: "unexpected data response for get_metadata".to_string(),
+            Response::Data(_) => Err(UnexpectedResponseSnafu {
+                msg_type: MessageType::DataChunk,
             }
             .build()),
             Response::Redirect { .. } | Response::Error { .. } => {
@@ -172,8 +174,8 @@ impl RuxioClient {
         .await?
         {
             Response::Data(data) => Ok(data),
-            other => Err(MembershipSnafu {
-                detail: format!("unexpected response for scan: {other:?}"),
+            other => Err(UnexpectedResponseSnafu {
+                msg_type: other.msg_type(),
             }
             .build()),
         }
