@@ -23,7 +23,7 @@ use ruxio_protocol::error_code;
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
 use ruxio_protocol::messages::{
     BatchReadRequest, ErrorResponse, GetMetadataRequest, MetadataResponse, ReadRangeRequest,
-    RedirectResponse, ScanRequest,
+    ScanRequest,
 };
 use ruxio_storage::cache::{CacheManager, RangeResult};
 use ruxio_storage::cache_trait::Cache;
@@ -874,26 +874,6 @@ async fn handle_read_range(
             )];
         }
     };
-
-    // Inter-node routing
-    if !ctx.membership.is_local(&req.uri) {
-        if let Some(owner) = ctx.membership.owner(&req.uri) {
-            let parts: Vec<&str> = owner.0.split(':').collect();
-            let host = parts.first().unwrap_or(&"unknown").to_string();
-            let port: u16 = parts
-                .get(1)
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(ruxio_common::settings::SETTINGS.data_port);
-            return vec![Frame::new_json_unchecked(
-                MessageType::Redirect,
-                request_id,
-                &RedirectResponse {
-                    target_host: host,
-                    target_data_port: port,
-                },
-            )];
-        }
-    }
 
     // Intra-node routing
     let owner_thread = ctx.owning_thread(&req.uri);
