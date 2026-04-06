@@ -54,18 +54,10 @@ impl ClientMembership {
             .collect()
     }
 
-    /// Get all current nodes.
+    /// Get all current nodes (used by tests and diagnostics).
+    #[cfg(test)]
     pub fn nodes(&self) -> Vec<NodeId> {
         self.ring.borrow().nodes().to_vec()
-    }
-
-    /// Force an immediate refresh by draining all pending membership events.
-    ///
-    /// Called when the client receives a Redirect, which signals a stale ring.
-    pub fn force_refresh(&self) -> bool {
-        let changed = self.drain_events();
-        self.last_refresh.set(Instant::now());
-        changed
     }
 
     /// Poll events if the refresh interval has elapsed.
@@ -129,12 +121,14 @@ mod tests {
     fn test_poll_join_event() {
         let nodes = make_nodes(2);
         let (tx, rx) = mpsc::channel();
-        let membership = ClientMembership::new(nodes, 150, rx, Duration::from_secs(5));
+        // Zero interval so maybe_refresh triggers immediately
+        let membership = ClientMembership::new(nodes, 150, rx, Duration::ZERO);
         assert_eq!(membership.nodes().len(), 2);
 
         tx.send(MembershipEvent::Joined(NodeId::new("node2", 8080)))
             .unwrap();
-        assert!(membership.force_refresh());
+        // owner() calls maybe_refresh() which drains the event
+        let _ = membership.owner("trigger-refresh");
         assert_eq!(membership.nodes().len(), 3);
     }
 
@@ -142,11 +136,11 @@ mod tests {
     fn test_poll_leave_event() {
         let nodes = make_nodes(3);
         let (tx, rx) = mpsc::channel();
-        let membership = ClientMembership::new(nodes, 150, rx, Duration::from_secs(5));
+        let membership = ClientMembership::new(nodes, 150, rx, Duration::ZERO);
 
         tx.send(MembershipEvent::Left(NodeId::new("node1", 8080)))
             .unwrap();
-        assert!(membership.force_refresh());
+        let _ = membership.owner("trigger-refresh");
         assert_eq!(membership.nodes().len(), 2);
     }
 
@@ -154,19 +148,21 @@ mod tests {
     fn test_poll_snapshot_replaces_ring() {
         let nodes = make_nodes(3);
         let (tx, rx) = mpsc::channel();
-        let membership = ClientMembership::new(nodes, 150, rx, Duration::from_secs(5));
+        let membership = ClientMembership::new(nodes, 150, rx, Duration::ZERO);
 
         let new_nodes = make_nodes(5);
         tx.send(MembershipEvent::Snapshot(new_nodes)).unwrap();
-        assert!(membership.force_refresh());
+        let _ = membership.owner("trigger-refresh");
         assert_eq!(membership.nodes().len(), 5);
     }
 
     #[test]
-    fn test_no_events_returns_false() {
+    fn test_no_events_no_change() {
         let nodes = make_nodes(2);
         let (_tx, rx) = mpsc::channel();
-        let membership = ClientMembership::new(nodes, 150, rx, Duration::from_secs(5));
-        assert!(!membership.force_refresh());
+        let membership = ClientMembership::new(nodes, 150, rx, Duration::ZERO);
+        // Calling owner triggers maybe_refresh, but no events → no change
+        let _ = membership.owner("test");
+        assert_eq!(membership.nodes().len(), 2);
     }
 }

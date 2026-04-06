@@ -8,10 +8,8 @@ use crate::response::Response;
 
 /// Route a request to the correct server via client-side hash ring.
 ///
-/// On redirect (stale ring): force-refreshes the membership view,
-/// then follows the redirect target.
-/// On retriable error: blacklists the failed node, tries the next
-/// candidate from the hash ring.
+/// On retriable error or connection failure: blacklists the failed node,
+/// tries the next candidate from the hash ring.
 pub(crate) async fn route_and_execute(
     uri: &str,
     frame: Frame,
@@ -19,21 +17,16 @@ pub(crate) async fn route_and_execute(
     pool: &ConnectionPool,
     max_retries: u32,
 ) -> error::Result<Response> {
-    let mut target_override: Option<NodeId> = None;
     let mut failed_nodes: Vec<NodeId> = Vec::new();
 
     for _attempt in 0..=max_retries {
-        let node = if let Some(ref target) = target_override {
-            target.clone()
-        } else {
-            match pick_node(membership, uri, &failed_nodes) {
-                Some(n) => n,
-                None => {
-                    return Err(NoServerAvailableSnafu {
-                        uri: uri.to_string(),
-                    }
-                    .build())
+        let node = match pick_node(membership, uri, &failed_nodes) {
+            Some(n) => n,
+            None => {
+                return Err(NoServerAvailableSnafu {
+                    uri: uri.to_string(),
                 }
+                .build())
             }
         };
 
@@ -44,14 +37,6 @@ pub(crate) async fn route_and_execute(
         };
 
         match pool.send_to(&node, request_frame).await {
-            Ok(Response::Redirect { host, port }) => {
-                // Stale ring — refresh membership and follow the redirect target.
-                tracing::debug!("Redirect for {uri} → {host}:{port}, refreshing ring");
-                membership.force_refresh();
-                pool.update_membership(&membership.nodes());
-                target_override = Some(NodeId::new(host, port));
-                continue;
-            }
             Ok(Response::Error {
                 error_code,
                 message,
@@ -60,7 +45,6 @@ pub(crate) async fn route_and_execute(
                     tracing::debug!("Retriable error for {uri} on {node}: {message}, retrying");
                     pool.invalidate(&node);
                     failed_nodes.push(node);
-                    target_override = None;
                     continue;
                 }
                 return Err(ServerSnafu {
@@ -74,7 +58,6 @@ pub(crate) async fn route_and_execute(
                 tracing::debug!("Connection error for {uri} on {node}: {e}, retrying");
                 pool.invalidate(&node);
                 failed_nodes.push(node);
-                target_override = None;
                 continue;
             }
         }

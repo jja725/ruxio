@@ -8,7 +8,7 @@ use monoio::net::TcpStream;
 
 use ruxio_cluster::ring::NodeId;
 use ruxio_protocol::frame::{Frame, FrameReader, MessageType};
-use ruxio_protocol::messages::{ErrorResponse, MetadataResponse, RedirectResponse};
+use ruxio_protocol::messages::{ErrorResponse, MetadataResponse};
 
 use crate::error::{
     self, ConnectionFailedSnafu, DeserializationSnafu, FrameSnafu, ReadFailedSnafu, TimeoutSnafu,
@@ -123,15 +123,6 @@ impl Connection {
                             message: err.message,
                         });
                     }
-                    MessageType::Redirect => {
-                        self.recv_buf = buf;
-                        let redir: RedirectResponse =
-                            serde_json::from_slice(&resp.payload).context(DeserializationSnafu)?;
-                        return Ok(Response::Redirect {
-                            host: redir.target_host,
-                            port: redir.target_data_port,
-                        });
-                    }
                     MessageType::Metadata => {
                         self.recv_buf = buf;
                         let meta: MetadataResponse =
@@ -220,11 +211,5 @@ impl ConnectionPool {
     /// Mark a connection as dead — will reconnect on next use.
     pub fn invalidate(&self, node: &NodeId) {
         self.connections.borrow_mut().insert(node.clone(), None);
-    }
-
-    /// Remove connections to nodes no longer in the membership.
-    pub fn update_membership(&self, current_nodes: &[NodeId]) {
-        let mut conns = self.connections.borrow_mut();
-        conns.retain(|node, _| current_nodes.contains(node));
     }
 }
